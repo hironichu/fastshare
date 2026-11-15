@@ -1,0 +1,17 @@
+# Rust / Cargo build artifacts
+/target/
+/target*/
+**/*.rs.bk
+*.pdb
+
+# Logs & temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Environment & IDE files
+.env
+.env.*
+.vscode/
+.idea/
