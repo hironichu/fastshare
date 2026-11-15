@@ -5,7 +5,6 @@ edition = "2021"
 authors = ["hironichu"]
 license = "MIT"
 repository = "https://github.com/hironichu/fastshare"
-homepage = "https://github.com/hironichu/fastshare"
 readme = "README.md"
 description = "Ultra-fast 10GbE direct folder sharing server with UPnP, in-browser 16x parallel downloader, password/token auth, quotas, IP blacklist, and live TUI dashboard"
 keywords = ["10gbe", "fileshare", "upnp", "http2", "tui"]

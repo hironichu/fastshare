@@ -431,12 +431,10 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
         };
         let icon = file_icon(&entry.name, entry.is_dir);
         let ticketed_rel_url = append_ticket(&entry.rel_url, &ctx.dl_ticket);
-        let full_url = format!("http://{}{}", ctx.host_header, ticketed_rel_url);
-        let escaped_full_url = html_escape(&full_url);
         let escaped_rel_url = html_escape(&ticketed_rel_url);
 
         if !entry.is_dir {
-            batch_urls_js.push((entry.name.clone(), full_url.clone()));
+            batch_urls_js.push((entry.name.clone(), ticketed_rel_url.clone()));
         }
 
         let actions_html = if entry.is_dir {
@@ -450,10 +448,10 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
             )
         } else {
             format!(
-                r#"<button class="btn btn-sm btn-turbo" onclick="startTurboDownload('{escaped_rel_url}', '{escaped_name}', {file_size})" title="In-Browser 16-Stream Concurrent 10GbE Downloader (No CLI needed!)">🚀 Turbo 16x</button>
+                r#"<button type="button" class="btn btn-sm btn-turbo" data-rel="{escaped_rel_url}" data-name="{escaped_name}" data-size="{file_size}" onclick="handleTurboBtn(this)" title="In-Browser 16-Stream Concurrent 10GbE Downloader (No CLI needed!)">🚀 Turbo 16x</button>
                    <a href="{dl_url}" download class="btn btn-sm btn-primary" title="Standard single-stream browser download">⬇ Direct</a>
-                   <button class="btn btn-sm btn-accent" onclick="copyAria2('{escaped_full_url}', '{escaped_name}')" title="Copy 16-connection parallel aria2c CLI command">⚡ aria2c</button>
-                   <button class="btn btn-sm" onclick="copyText('{escaped_full_url}', 'Direct link copied!')" title="Copy direct URL">🔗</button>"#,
+                   <button type="button" class="btn btn-sm btn-accent" data-rel="{escaped_rel_url}" data-name="{escaped_name}" onclick="handleAria2Btn(this)" title="Copy 16-connection parallel aria2c CLI command">⚡ aria2c</button>
+                   <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" onclick="handleCopyLinkBtn(this)" title="Copy direct URL">🔗</button>"#,
                 dl_url = ticketed_rel_url,
                 file_size = entry.size
             )
@@ -953,7 +951,56 @@ function showToast(msg) {{
 }}
 
 function copyText(txt, msg) {{
-  navigator.clipboard.writeText(txt).then(() => showToast(msg || 'Copied to clipboard!'));
+  if (navigator.clipboard && window.isSecureContext) {{
+    navigator.clipboard.writeText(txt)
+      .then(() => showToast(msg || 'Copied to clipboard!'))
+      .catch(() => fallbackCopy(txt, msg));
+  }} else {{
+    fallbackCopy(txt, msg);
+  }}
+}}
+
+function fallbackCopy(txt, msg) {{
+  const ta = document.createElement('textarea');
+  ta.value = txt;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  ta.style.top = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {{
+    const ok = document.execCommand('copy');
+    if (ok) {{
+      showToast(msg || 'Copied to clipboard!');
+    }} else {{
+      window.prompt('Copy command to clipboard (Ctrl+C):', txt);
+    }}
+  }} catch (_) {{
+    window.prompt('Copy command to clipboard (Ctrl+C):', txt);
+  }}
+  ta.remove();
+}}
+
+function handleTurboBtn(btn) {{
+  const relUrl = btn.getAttribute('data-rel') || '';
+  const name = btn.getAttribute('data-name') || 'download.bin';
+  const size = parseInt(btn.getAttribute('data-size') || '0', 10);
+  startTurboDownload(relUrl, name, size);
+}}
+
+function handleAria2Btn(btn) {{
+  const relUrl = btn.getAttribute('data-rel') || '';
+  const name = btn.getAttribute('data-name') || 'download.bin';
+  const fullUrl = window.location.origin + relUrl;
+  copyAria2(fullUrl, name);
+}}
+
+function handleCopyLinkBtn(btn) {{
+  const relUrl = btn.getAttribute('data-rel') || '';
+  const fullUrl = window.location.origin + relUrl;
+  copyText(fullUrl, 'Direct link copied!');
 }}
 
 function copyAria2(url, name) {{
@@ -967,8 +1014,9 @@ function copyBatchAria2() {{
     showToast('No files in current directory to batch download.');
     return;
   }}
-  const cmds = BATCH_FILES.map(([name, url]) => {{
+  const cmds = BATCH_FILES.map(([name, relUrl]) => {{
     const safeName = name.replace(/"/g, '\\"');
+    const url = window.location.origin + relUrl;
     return `aria2c -x 16 -s 16 -k 4M --file-allocation=none -o "${{safeName}}" "${{url}}"`;
   }}).join(' && ');
   copyText(cmds, `Copied batch aria2c command for ${{BATCH_FILES.length}} file(s)!`);
