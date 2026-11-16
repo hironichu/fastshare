@@ -449,8 +449,9 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
         } else {
             format!(
                 r#"<button type="button" class="btn btn-sm btn-turbo" data-rel="{escaped_rel_url}" data-name="{escaped_name}" data-size="{file_size}" onclick="handleTurboBtn(this)" title="In-Browser 16-Stream Concurrent 10GbE Downloader (No CLI needed!)">🚀 Turbo 16x</button>
+                   <button type="button" class="btn btn-sm btn-accent" data-rel="{escaped_rel_url}" data-name="{escaped_name}" onclick="handleOpenShellBtn(this)" title="Directly launch native 16-stream 10GbE shell via fastshare:// protocol">⚡ Open 10G Shell</button>
+                   <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" data-name="{escaped_name}" onclick="handleAria2Btn(this)" title="Copy aria2c command (or Shift+Click to download runnable .cmd launcher)">⚡ aria2c</button>
                    <a href="{dl_url}" download class="btn btn-sm btn-primary" title="Standard single-stream browser download">⬇ Direct</a>
-                   <button type="button" class="btn btn-sm btn-accent" data-rel="{escaped_rel_url}" data-name="{escaped_name}" onclick="handleAria2Btn(this)" title="Copy 16-connection parallel aria2c CLI command">⚡ aria2c</button>
                    <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" onclick="handleCopyLinkBtn(this)" title="Copy direct URL">🔗</button>"#,
                 dl_url = ticketed_rel_url,
                 file_size = entry.size
@@ -906,8 +907,10 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
   </div>
 
   <div class="tip-box">
-    <strong>🚀 In-Browser 16x Concurrent Engine (`🚀 Turbo 16x`):</strong>
-    Click <strong>🚀 Turbo 16x</strong> on any file to launch up to <strong>16 parallel HTTP Range TCP streams</strong> directly inside your browser (striping across wildcard DNS shards when available to bypass browser per-host connection caps) — or use <strong>⚡ aria2c</strong> for massive multi-tens-of-GB archives.
+    <strong>🚀 Three Ways to Saturate 10GbE:</strong>
+    1) Click <strong>🚀 Turbo 16x</strong> for 16 parallel streams right inside your browser tab &bull;
+    2) Run <code>fastshare --register-protocol</code> once, then click <strong>⚡ Open 10G Shell</strong> to pop open the native 16-stream Rust downloader directly from your browser &bull;
+    3) Click <strong>⚡ aria2c</strong> to copy the command (or <strong>Shift+Click ⚡ aria2c</strong> to download a runnable <code>.cmd</code> shell script).
   </div>
 </div>
 
@@ -990,11 +993,38 @@ function handleTurboBtn(btn) {{
   startTurboDownload(relUrl, name, size);
 }}
 
+function handleOpenShellBtn(btn) {{
+  const relUrl = btn.getAttribute('data-rel') || '';
+  const fullUrl = window.location.origin + relUrl;
+  const protoUrl = 'fastshare://' + fullUrl;
+  showToast('Launching FastShare 10G Shell (run `fastshare --register-protocol` once if not registered)...');
+  window.location.href = protoUrl;
+}}
+
 function handleAria2Btn(btn) {{
   const relUrl = btn.getAttribute('data-rel') || '';
   const name = btn.getAttribute('data-name') || 'download.bin';
   const fullUrl = window.location.origin + relUrl;
-  copyAria2(fullUrl, name);
+  if (window.event && window.event.shiftKey) {{
+    downloadCmdLauncher(fullUrl, name);
+  }} else {{
+    copyAria2(fullUrl, name);
+  }}
+}}
+
+function downloadCmdLauncher(url, name) {{
+  const safeName = name.replace(/"/g, '_');
+  const script = `@echo off\r\ntitle FastShare 10G - ${{safeName}}\r\necho Starting 16-stream 10GbE download for "${{safeName}}"...\r\nwhere aria2c >nul 2>nul\r\nif %ERRORLEVEL% EQU 0 (\r\n  aria2c -x 16 -s 16 -k 4M --file-allocation=none -o "${{safeName}}" "${{url}}"\r\n) else (\r\n  where fastshare >nul 2>nul\r\n  if %ERRORLEVEL% EQU 0 (\r\n    fastshare --download "${{url}}"\r\n  ) else (\r\n    echo aria2c not found in PATH, falling back to curl...\r\n    curl -fLo "${{safeName}}" "${{url}}"\r\n  )\r\n)\r\npause\r\n`;
+  const blob = new Blob([script], {{ type: 'application/x-bat' }});
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = `download-${{safeName}}.cmd`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+  showToast(`Downloaded 1-click shell script download-${{safeName}}.cmd!`);
 }}
 
 function handleCopyLinkBtn(btn) {{

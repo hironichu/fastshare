@@ -65,6 +65,12 @@ fastshare "D:\SharedWithFriend" --max-gb 50 --blacklist "198.51.100.0/24,203.0.1
 
 # 4. Use a specific port with manual port forwarding (disable UPnP)
 fastshare "D:\SharedWithFriend" --port 28080 --no-upnp
+
+# 5. Register 1-Click Browser Protocol Handler (`fastshare://`) on the client machine
+fastshare --register-protocol
+
+# 6. Download a file directly using the built-in 16-stream 10GbE client
+fastshare --download "http://<IP>:<PORT>/<TOKEN>/large_file.iso"
 ```
 
 ---

@@ -79,6 +79,28 @@ fn bind_10g_listener(bind_ip: &str, requested_port: Option<u16>) -> Result<(TcpL
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.register_protocol {
+        return fastshare::client::register_protocol_handler();
+    }
+
+    if let Some(dl_url) = &args.download {
+        return fastshare::client::run_parallel_download(
+            dl_url,
+            args.connections,
+            args.output.as_deref(),
+        )
+        .await;
+    }
+
+    if args.path.starts_with("http://") || args.path.starts_with("fastshare://") {
+        return fastshare::client::run_parallel_download(
+            &args.path,
+            args.connections,
+            args.output.as_deref(),
+        )
+        .await;
+    }
+
     let root_dir = std::fs::canonicalize(&args.path)
         .with_context(|| format!("Failed to resolve directory: {:?}", args.path))?;
     if !root_dir.is_dir() {

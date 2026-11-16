@@ -5,12 +5,28 @@ use std::path::PathBuf;
 #[command(
     name = "fastshare",
     version,
-    about = "10GbE ultra-fast & secure direct folder sharing server with UPnP, password/token auth, quotas, IP blacklist & live TUI"
+    about = "10GbE ultra-fast & secure direct folder sharing server & 16-stream parallel client"
 )]
 pub struct Args {
-    /// Directory to share (defaults to current working directory)
+    /// Directory to share (or a http:// / fastshare:// URL to download in 16-stream client mode)
     #[arg(default_value = ".")]
-    pub path: PathBuf,
+    pub path: String,
+
+    /// Download a file or URL using the built-in 16-stream 10GbE client (also triggered by `fastshare://` browser links)
+    #[arg(short = 'd', long)]
+    pub download: Option<String>,
+
+    /// Register `fastshare://` as a 1-click browser protocol handler (no Admin required on Windows)
+    #[arg(long)]
+    pub register_protocol: bool,
+
+    /// Number of parallel TCP connections when downloading in client mode
+    #[arg(short = 'x', long, default_value_t = 16)]
+    pub connections: usize,
+
+    /// Output directory when downloading in client mode (defaults to ~/Downloads)
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
 
     /// Port to listen on (defaults to a random unprivileged port between 10000 and 60000)
     #[arg(short, long)]
@@ -24,7 +40,7 @@ pub struct Args {
     #[arg(short, long)]
     pub token: Option<String>,
 
-    /// Optional password to protect the share link (enables web lock screen + HTTP Basic Auth + signed aria2c tickets)
+    /// Optional password to protect the share link (enables web lock screen + signed download tickets)
     #[arg(short = 'P', long)]
     pub password: Option<String>,
 
