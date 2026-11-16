@@ -5,18 +5,18 @@ use std::path::PathBuf;
 #[command(
     name = "fastshare",
     version,
-    about = "10GbE ultra-fast & secure direct folder sharing server & 16-stream parallel client"
+    about = "High-throughput HTTP/2 file sharing server with UPnP IGD, token/HMAC authentication, quotas, and TUI telemetry"
 )]
 pub struct Args {
-    /// Directory to share (or a http:// / fastshare:// URL to download in 16-stream client mode)
+    /// Directory to serve (or a http:// / fastshare:// URI when running in client mode)
     #[arg(default_value = ".")]
     pub path: String,
 
-    /// Download a file or URL using the built-in 16-stream 10GbE client (also triggered by `fastshare://` browser links)
+    /// Download a target URL via aria2c or the built-in multi-stream HTTP Range client
     #[arg(short = 'd', long)]
     pub download: Option<String>,
 
-    /// Register `fastshare://` as a 1-click browser protocol handler (no Admin required on Windows)
+    /// Register `fastshare://` URI protocol handler for the current user
     #[arg(long)]
     pub register_protocol: bool,
 

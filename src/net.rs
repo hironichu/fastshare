@@ -164,7 +164,7 @@ pub async fn setup_upnp_and_public_ip(
                         port,
                         SocketAddr::V4(local_sock),
                         3600,
-                        "fastshare-10g",
+                        "fastshare",
                     )
                     .await;
 
@@ -175,7 +175,7 @@ pub async fn setup_upnp_and_public_ip(
                             port,
                             SocketAddr::V4(local_sock),
                             0,
-                            "fastshare-10g",
+                            "fastshare",
                         )
                         .await;
                 }

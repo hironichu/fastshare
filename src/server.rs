@@ -99,8 +99,8 @@ async fn security_headers_and_ip_guard(
                     StatusCode::FORBIDDEN,
                     Html(render_status_page(
                         "403 Access Denied",
-                        "Your IP address has been blacklisted by the server administrator.",
-                        "🚫",
+                        "Client IP address is blocked by server policy.",
+                        "HTTP 403",
                     )),
                 )
                     .into_response(),
@@ -116,11 +116,11 @@ async fn security_headers_and_ip_guard(
             .read()
             .ok()
             .and_then(|r| r.clone())
-            .unwrap_or_else(|| "This share link has expired or reached its download limit.".to_string());
+            .unwrap_or_else(|| "This share link has expired or reached its configured quota.".to_string());
         return attach_security_headers(
             (
                 StatusCode::GONE,
-                Html(render_status_page("410 Share Link Closed", &reason, "⏱️")),
+                Html(render_status_page("410 Gone", &reason, "HTTP 410")),
             )
                 .into_response(),
         );
@@ -184,7 +184,7 @@ fn not_found_token_response() -> Response {
         Html(render_status_page(
             "404 Not Found",
             "A valid share token is required in the URL.",
-            "🔍",
+            "HTTP 404",
         )),
     )
         .into_response()
@@ -448,8 +448,8 @@ async fn serve_entry(
                     StatusCode::NOT_FOUND,
                     Html(render_status_page(
                         "404 Not Found",
-                        "The requested file or folder does not exist.",
-                        "🔍",
+                        "The requested file or directory does not exist.",
+                        "HTTP 404",
                     )),
                 )
                     .into_response()
@@ -463,8 +463,8 @@ async fn serve_entry(
                 StatusCode::NOT_FOUND,
                 Html(render_status_page(
                     "404 Not Found",
-                    "The requested file or folder could not be read.",
-                    "🔍",
+                    "The requested file or directory could not be read.",
+                    "HTTP 404",
                 )),
             )
                 .into_response()
@@ -519,8 +519,8 @@ fn check_download_gates(
             StatusCode::TOO_MANY_REQUESTS,
             Html(render_status_page(
                 "429 Too Many Concurrent Streams",
-                "Maximum simultaneous connections reached. Please wait for current transfers to finish.",
-                "🚦",
+                "Maximum simultaneous connections reached.",
+                "HTTP 429",
             )),
         )
             .into_response());
@@ -541,7 +541,7 @@ fn check_download_gates(
             ));
             return Err((
                 StatusCode::GONE,
-                Html(render_status_page("410 Download Limit Reached", &reason, "🛑")),
+                Html(render_status_page("410 Quota Reached", &reason, "HTTP 410")),
             )
                 .into_response());
         }

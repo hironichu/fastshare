@@ -1,89 +1,75 @@
-# ⚡ FastShare 10G
+# FastShare
 
 [![CI & Release](https://github.com/hironichu/fastshare/actions/workflows/ci-release.yml/badge.svg)](https://github.com/hironichu/fastshare/actions/workflows/ci-release.yml)
-[![Latest Release](https://img.shields.io/github/v/release/hironichu/fastshare?label=Release)](https://github.com/hironichu/fastshare/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/hironichu/fastshare?label=release)](https://github.com/hironichu/fastshare/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Ultra-fast, hardened Rust HTTP/1.1 & HTTP/2 direct folder sharing server engineered to saturate **10GbE fiber connections** directly from your machine—complete with **In-Browser 16x Concurrent Downloading (`🚀 Turbo 16x`)**, automatic **UPnP IGD port mapping**, **password & capability-token security**, **download/bandwidth quotas**, **TTL auto-expiration**, and a **live Ratatui terminal dashboard**.
+`fastshare` is a single-binary HTTP/1.1 and HTTP/2 directory server written in Rust for high-bandwidth direct file transfers over LAN or WAN.
 
----
+## Architecture & Capabilities
 
-## ✨ Key Features
+- **Socket & Protocol Tuning**
+  - Configures `4 MiB` kernel socket send buffers (`SO_SNDBUF`), disables Nagle's algorithm (`TCP_NODELAY`), and increases HTTP/2 flow-control windows (`16 MiB` connection / `4 MiB` stream).
+  - Streams file payloads asynchronously in `2 MiB` chunks (configurable via `--chunk-size-kb`) with RFC 7233 `Range` (`206 Partial Content`) support for multi-connection segmented transfers.
+- **On-the-Fly Directory Archiving**
+  - Streams directories directly over the socket as uncompressed `.zip` (`Compression::Stored` to avoid CPU-bound deflate bottlenecks) or POSIX `.tar` archives without temporary disk staging.
+- **NAT Traversal (UPnP IGD)**
+  - Performs routing-aware LAN interface discovery (filtering out CGNAT/VPN/virtual interfaces) and binds SSDP discovery directly to the outbound LAN adapter, with unicast gateway fallback.
+  - Automatically removes the UPnP port mapping on process exit, signal interruption, TTL expiration, or quota exhaustion.
+- **Access Control & Security**
+  - **Ephemeral Port Allocation**: Binds to a random unprivileged port in `10000..=60000` by default unless `--port` is specified.
+  - **Token & HMAC Authentication**: Generates a 24-character capability token verified in constant time. When `--password` is set, enforces session authentication via IP-bound `HMAC-SHA256` cookies (`HttpOnly; SameSite=Strict`) and signed query tickets (`?key=`) for external CLI clients.
+  - **IP / CIDR Filtering & Brute-Force Mitigation**: Supports static IPv4/IPv6 and CIDR blacklists (`--blacklist`, `--blacklist-file`), runtime TUI ban/unban controls, and automatic IP blacklisting after `--max-auth-failures` failed authentication attempts.
+  - **Filesystem Containment**: Canonicalizes all resolved paths against the root directory, rejects non-normal path components, blocks dotfiles by default (`--allow-hidden` to override), and applies strict CSP, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers.
+- **Transfer Quotas & Session TTL**
+  - Supports session expiration timers (`--ttl`), logical download limits (`--max-downloads`, deduplicating concurrent `Range` requests per `(client_ip, file)` session), and total byte transfer caps (`--max-gb`).
+- **Client Integration (`aria2c` & Parallel Web Engine)**
+  - Web interface includes a multi-stream `Range` downloader (`Parallel`), one-click `aria2c` integration (dispatching to local `aria2c` JSON-RPC on `:6800`/`:16800`, invoking the `fastshare://` URI handler, and copying the `aria2c` command to the clipboard), and a terminal telemetry interface (`ratatui`).
 
-- **🚀 In-Browser 16x Parallel Turbo Engine (`🚀 Turbo 16x`)**:
-  - Saturate 10GbE links **directly inside the web browser** without requiring external CLI downloaders.
-  - Automatically stripes `8 MiB` `HTTP Range` requests across wildcard DNS shards (`s1..s4.<ip>.sslip.io`, with automatic fallback to 6x same-origin streams) to bypass the browser's 6-connection-per-host limit and open **16 concurrent TCP streams**.
-  - Streams directly to disk via the native File System Access API (`showSaveFilePicker`) when available, or zero-copy `Blob` assembly, complete with a real-time in-browser **Gbps / MiB/s** HUD and 16-worker activity grid.
-- **⚡ 10GbE Tuned Kernel & HTTP/2 Streaming**:
-  - Uses large `2 MiB` async streaming chunks (configurable via `--chunk-size-kb`), `4 MiB` kernel TCP socket send buffers (`SO_SNDBUF`), `TCP_NODELAY`, and enlarged HTTP/2 flow-control windows (`16 MiB` connection / `4 MiB` stream).
-  - Full **HTTP Range (`206 Partial Content`)** support and one-click `aria2c -x 16 -s 16` command copy for CLI power users.
-- **🔒 Hardened Backend Security**:
-  - **Random Unprivileged Port by Default**: Picks a cryptographically random port in `10000..=60000` on startup (or specify `-p / --port <PORT>`).
-  - **24-Character Capability Token + Optional Password Protection (`-P / --password`)**:
-    - Constant-time HMAC-SHA256 verification.
-    - Custom dark-mode glassmorphism lock screen (`HttpOnly; SameSite=Strict` session cookie) plus signed HMAC download tickets (`?key=...`) for `aria2c`/`curl`.
-  - **IP & CIDR Blacklist + Automatic Brute-Force Ban**:
-    - Block specific IPs or IPv4/IPv6 CIDR subnets (`--blacklist 203.0.113.5,198.51.100.0/24` or `--blacklist-file`), ban/unban IPs live in the TUI (`[b]` / `[u]`), and automatically ban IPs after `--max-auth-failures` (default `5`) failed attempts.
-  - **Path Traversal & Dotfile Containment**:
-    - Canonical path containment (`std::fs::canonicalize`), dotfile/hidden-file blocking by default (`--allow-hidden` to override), and strict CSP / `X-Frame-Options: DENY` / `nosniff` security headers.
-- **⏱️ Download Quotas & Auto-Expiration Timer (`--ttl`)**:
-  - **Expiration Timer (`-e / --ttl 30m`)**: Automatically disables the share link, shuts down the server, and removes the UPnP port mapping from your router when the countdown ends.
-  - **Download Limits (`-m / --max-downloads <N>` & `--max-gb <GiB>`)**: Smartly groups parallel `Range` chunks from the same client IP + file into **1 logical download**, and automatically closes the server + UPnP port once completed.
-- **📦 Zero-Temp-File Folder Archiving**:
-  - Stream any folder on-the-fly as an **uncompressed `.zip`** (`Compression::Stored` for zero CPU bottleneck at 10 Gbps) or **`.tar`** directly to your friend's browser.
-- **📊 Live Terminal Dashboard (TUI)**:
-  - Built with `ratatui` — displays Public & LAN share URLs, UPnP status, live throughput in **Gbps & MiB/s**, a bandwidth sparkline, active connections, TTL & quota counters, and interactive IP ban controls.
+## Installation
 
----
+### Prebuilt Binaries
+Download the latest archive for Windows (`x86_64`), Linux (`x86_64`), or macOS (`arm64`) from [GitHub Releases](https://github.com/hironichu/fastshare/releases).
 
-## 🚀 Quick Start
-
-### Option 1: Download Prebuilt Binary
-Download the latest prebuilt archive for **Windows**, **Linux**, or **macOS** from the [**GitHub Releases**](https://github.com/hironichu/fastshare/releases) page.
-
-### Option 2: Build from Source
+### Build from Source
 ```bash
 git clone git@github.com:hironichu/fastshare.git
 cd fastshare
-cargo build --release
+cargo build --release --locked
 ```
-The optimized binary will be generated at `target/release/fastshare` (`target\release\fastshare.exe` on Windows).
 
----
+## Usage
 
-## 💻 Usage Examples
+```bash
+# Serve a directory on a random port with UPnP port mapping
+fastshare /path/to/dir
 
-```powershell
-# 1. Share a folder on a random port with automatic UPnP + random 24-char token
-fastshare "D:\SharedWithFriend"
+# Require a password, expire after 30 minutes, and cap at 5 logical downloads
+fastshare /path/to/dir -P "secret" --ttl 30m --max-downloads 5
 
-# 2. Password-protected share that expires in 45 minutes and allows at most 3 downloads
-fastshare "D:\SharedWithFriend" -P "MySecretPass" --ttl 45m --max-downloads 3
+# Cap total outbound transfer at 50 GiB and block specific subnets
+fastshare /path/to/dir --max-gb 50 --blacklist "198.51.100.0/24,203.0.113.50"
 
-# 3. Cap total data transfer to 50 GiB and block specific IP/CIDR ranges
-fastshare "D:\SharedWithFriend" --max-gb 50 --blacklist "198.51.100.0/24,203.0.113.50"
+# Bind to a specific port without UPnP (manual port forwarding)
+fastshare /path/to/dir --port 28080 --no-upnp
 
-# 4. Use a specific port with manual port forwarding (disable UPnP)
-fastshare "D:\SharedWithFriend" --port 28080 --no-upnp
-
-# 5. Register 1-Click Browser Protocol Handler (`fastshare://`) on the client machine
+# Register `fastshare://` URI handler on a client machine to launch aria2c from the browser
 fastshare --register-protocol
-
-# 6. Download a file directly using the built-in 16-stream 10GbE client
-fastshare --download "http://<IP>:<PORT>/<TOKEN>/large_file.iso"
 ```
 
----
-
-## ⚙️ CLI Options
+## CLI Reference
 
 ```text
 Usage: fastshare [OPTIONS] [PATH]
 
 Arguments:
-  [PATH]  Directory to share (defaults to current working directory) [default: .]
+  [PATH]  Directory to serve (or a http:// / fastshare:// URI when running in client mode) [default: .]
 
 Options:
+  -d, --download <DOWNLOAD>                  Download a target URL via aria2c or the built-in multi-stream HTTP Range client
+      --register-protocol                    Register `fastshare://` URI protocol handler for the current user
+  -x, --connections <CONNECTIONS>            Number of parallel TCP connections when downloading in client mode [default: 16]
+  -o, --output <OUTPUT>                      Output directory when downloading in client mode (defaults to ~/Downloads)
   -p, --port <PORT>                          Port to listen on (defaults to a random unprivileged port between 10000 and 60000)
   -b, --bind <BIND>                          Bind address [default: 0.0.0.0]
   -t, --token <TOKEN>                        Custom secret token in the URL (auto-generated 24-char random token if omitted)
@@ -98,13 +84,11 @@ Options:
       --allow-hidden                         Allow serving hidden files / dotfiles (blocked by default for security)
       --no-upnp                              Disable automatic UPnP port forwarding
       --no-tui                               Disable interactive TUI and print logs to stdout instead
-      --chunk-size-kb <CHUNK_SIZE_KB>        Read chunk size in KiB for 10GbE streaming [default: 2048]
+      --chunk-size-kb <CHUNK_SIZE_KB>        Read chunk size in KiB for streaming [default: 2048]
   -h, --help                                 Print help
   -V, --version                              Print version
 ```
 
----
+## License
 
-## 📄 License
-
-Licensed under the [MIT License](LICENSE).
+MIT — see [LICENSE](LICENSE).

@@ -236,26 +236,25 @@ async fn main() -> Result<()> {
         )
         .await?;
     } else {
-        println!("============================================================");
-        println!(" ⚡ FastShare 10GbE — Secure Direct Folder Server");
-        println!("============================================================");
-        println!(" Shared Folder : {}", root_dir.display());
+        println!("------------------------------------------------------------");
+        println!("FastShare — HTTP/2 File Server");
+        println!("------------------------------------------------------------");
+        println!("Directory     : {}", root_dir.display());
         println!(
-            " LAN Share URL : http://{}:{}/{}/",
+            "LAN URL       : http://{}:{}/{}/",
             local_ip, actual_port, token
         );
         if metrics.security.requires_password() {
-            println!(" Auth Mode     : Password Protected + Secret Token");
+            println!("Authentication: Password + Token (HMAC-SHA256)");
         } else {
-            println!(" Auth Mode     : Secret Token URL");
+            println!("Authentication: Token URL");
         }
         if let Some(d) = ttl {
-            println!(" Auto-Expire   : {}", format_duration(d));
+            println!("Session TTL   : {}", format_duration(d));
         }
         if let Some(m) = args.max_downloads {
-            println!(" Max Downloads : {}", m);
+            println!("Download Cap  : {}", m);
         }
-        println!(" Press Ctrl+C to stop the server & close the UPnP port.");
         println!("------------------------------------------------------------");
 
         let metrics_log = Arc::clone(&metrics);
@@ -265,7 +264,7 @@ async fn main() -> Result<()> {
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    println!("\nShutting down server and closing UPnP port...");
+                    println!("\nShutting down server and releasing UPnP lease...");
                     let _ = shutdown_tx.send(true);
                     break;
                 }
@@ -280,7 +279,7 @@ async fn main() -> Result<()> {
                     let active_cnt = metrics_log.active_count();
                     let total_sent = metrics_log.total_bytes_sent.load(Ordering::Relaxed);
                     if let Some(reason) = metrics_log.security.check_quota_exhausted(active_cnt, total_sent) {
-                        println!("\n[AUTO-SHUTDOWN] {} — Closing server and UPnP port...", reason);
+                        println!("\n[SHUTDOWN] {} — Releasing UPnP lease...", reason);
                         let _ = shutdown_tx.send(true);
                         break;
                     }
@@ -288,8 +287,8 @@ async fn main() -> Result<()> {
                     if !printed_public {
                         if let Ok(info) = metrics_log.net_info.read() {
                             if let Some(pub_ip) = &info.public_ip {
-                                println!(" Public URL    : http://{}:{}/{}/", pub_ip, actual_port, token);
-                                println!(" UPnP Status   : {}", info.upnp_status);
+                                println!("Public URL    : http://{}:{}/{}/", pub_ip, actual_port, token);
+                                println!("UPnP Status   : {}", info.upnp_status);
                                 printed_public = true;
                             }
                         }

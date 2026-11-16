@@ -4,6 +4,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::io::SeekFrom;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,12 +12,11 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-/// Register the `fastshare://` custom URL protocol handler for the current user (no Admin required on Windows).
-/// Once registered, clicking "⚡ Launch App (16x)" in the web browser directly spawns `fastshare` in a terminal
-/// and starts a 16-connection parallel 10GbE download!
+/// Register the `fastshare://` URI scheme for the current user (`HKCU\Software\Classes\fastshare` on Windows,
+/// or XDG desktop entry on Linux). When triggered from the browser, `fastshare` launches `aria2c` directly
+/// (or falls back to the built-in multi-stream HTTP Range client if `aria2c` is not in `PATH`).
 pub fn register_protocol_handler() -> Result<()> {
     let exe_path = std::env::current_exe().context("Failed to locate current executable path")?;
-    // Strip Windows extended-length prefix `\\?\` if present
     let exe_str = exe_path
         .to_string_lossy()
         .trim_start_matches(r"\\?\")
@@ -24,15 +24,13 @@ pub fn register_protocol_handler() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-
         let status1 = Command::new("reg")
             .args([
                 "add",
                 r"HKCU\Software\Classes\fastshare",
                 "/ve",
                 "/d",
-                "URL:FastShare 10G Protocol",
+                "URL:FastShare Protocol",
                 "/f",
             ])
             .status()
@@ -63,13 +61,8 @@ pub fn register_protocol_handler() -> Result<()> {
             .status()?;
 
         if status1.success() && status2.success() && status3.success() {
-            println!("============================================================");
-            println!(" ✅ Registered `fastshare://` 1-Click Browser Protocol!");
-            println!("============================================================");
-            println!(" Executable : {}", exe_str);
-            println!(" Registry   : HKCU\\Software\\Classes\\fastshare");
-            println!(" You can now click [⚡ Open 10G Shell] in any browser to");
-            println!(" automatically launch a 16-stream 10GbE native download!");
+            println!("Registered 'fastshare://' URI scheme in HKCU\\Software\\Classes\\fastshare");
+            println!("Handler command: {}", cmd_val);
             return Ok(());
         } else {
             anyhow::bail!("reg.exe returned a non-zero exit code while registering protocol");
@@ -85,26 +78,27 @@ pub fn register_protocol_handler() -> Result<()> {
         let content = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
-             Name=FastShare 10G Downloader\n\
+             Name=FastShare Handler\n\
              Exec=\"{}\" --download %u\n\
              Terminal=true\n\
              MimeType=x-scheme-handler/fastshare;\n",
             exe_str
         );
         std::fs::write(&desktop_file, content)?;
-        let _ = std::process::Command::new("xdg-mime")
+        let _ = Command::new("xdg-mime")
             .args([
                 "default",
                 "fastshare-handler.desktop",
                 "x-scheme-handler/fastshare",
             ])
             .status();
-        println!("✅ Registered `fastshare://` protocol handler in {:?}", desktop_file);
+        println!("Registered 'fastshare://' URI handler at {:?}", desktop_file);
         Ok(())
     }
 }
 
 struct ParsedUrl {
+    http_url: String,
     host: String,
     port: u16,
     path_and_query: String,
@@ -114,14 +108,18 @@ struct ParsedUrl {
 fn parse_download_target(raw_input: &str) -> Result<ParsedUrl> {
     let trimmed = raw_input.trim().trim_matches('"');
 
-    // Support `fastshare://http://host:port/path` or `fastshare://host:port/path` or `http://host:port/path`
+    // Accept `fastshare://host:port/path`, `fastshare://http://host:port/path`, or `http://host:port/path`
     let without_scheme = if let Some(rest) = trimmed.strip_prefix("fastshare://") {
-        let rest = rest.strip_prefix("http://").or_else(|| rest.strip_prefix("http/")).unwrap_or(rest);
-        rest
+        rest.strip_prefix("http://")
+            .or_else(|| rest.strip_prefix("http/"))
+            .unwrap_or(rest)
     } else if let Some(rest) = trimmed.strip_prefix("http://") {
         rest
     } else {
-        anyhow::bail!("Unsupported URL scheme in '{}' (expected http:// or fastshare://)", trimmed);
+        anyhow::bail!(
+            "Unsupported URI scheme in '{}' (expected http:// or fastshare://)",
+            trimmed
+        );
     };
 
     let (host_port, path_part) = match without_scheme.find('/') {
@@ -147,7 +145,10 @@ fn parse_download_target(raw_input: &str) -> Result<ParsedUrl> {
         .decode_utf8_lossy()
         .to_string();
 
+    let http_url = format!("http://{}:{}{}", host, port, path_part);
+
     Ok(ParsedUrl {
+        http_url,
         host,
         port,
         path_and_query: path_part.to_string(),
@@ -192,29 +193,72 @@ fn default_downloads_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn connect_10g_stream(addr: SocketAddr) -> Result<TcpStream> {
+fn connect_stream(addr: SocketAddr) -> Result<TcpStream> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024); // 4 MiB receive buffer
+    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_nodelay(true);
     socket.connect_timeout(&addr.into(), Duration::from_secs(5))?;
     socket.set_nonblocking(true)?;
     Ok(TcpStream::from_std(socket.into())?)
 }
 
-/// Run the built-in 16-connection 10GbE parallel downloader.
+/// Download a target URL:
+/// 1. First attempts to invoke `aria2c` directly in the terminal if installed on `PATH`.
+/// 2. If `aria2c` is not found in `PATH`, falls back to the built-in multi-stream HTTP Range client.
 pub async fn run_parallel_download(
     target_url: &str,
     connections: usize,
     output_dir: Option<&Path>,
 ) -> Result<()> {
+    let is_protocol_launch = target_url.trim().starts_with("fastshare://");
     let parsed = parse_download_target(target_url)?;
     let num_conns = connections.clamp(1, 32);
 
-    println!("============================================================");
-    println!(" ⚡ FastShare 10GbE — Native {}-Stream Parallel Downloader", num_conns);
-    println!("============================================================");
-    println!(" Connecting to {}:{} ...", parsed.host, parsed.port);
+    let dest_dir = output_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_downloads_dir);
+    std::fs::create_dir_all(&dest_dir)?;
+
+    // Check if `aria2c` is available on the system and execute it directly
+    let conns_str = num_conns.to_string();
+    let dir_str = dest_dir.to_string_lossy().to_string();
+    let aria2_status = Command::new("aria2c")
+        .args([
+            "-x",
+            &conns_str,
+            "-s",
+            &conns_str,
+            "-k",
+            "4M",
+            "--file-allocation=none",
+            "-d",
+            &dir_str,
+            "-o",
+            &parsed.fallback_filename,
+            &parsed.http_url,
+        ])
+        .status();
+
+    match aria2_status {
+        Ok(status) => {
+            if is_protocol_launch {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            if status.success() {
+                return Ok(());
+            } else {
+                anyhow::bail!("aria2c exited with status {}", status);
+            }
+        }
+        Err(_) => {
+            println!("aria2c not found in PATH; using built-in {}-stream HTTP Range client.", num_conns);
+        }
+    }
+
+    println!("------------------------------------------------------------");
+    println!("FastShare Client ({} parallel connections)", num_conns);
+    println!("Connecting to {}:{} ...", parsed.host, parsed.port);
 
     let sock_addr = format!("{}:{}", parsed.host, parsed.port)
         .to_socket_addrs()
@@ -222,11 +266,11 @@ pub async fn run_parallel_download(
         .next()
         .context("No IP addresses resolved for host")?;
 
-    // 1. Send HEAD request to inspect Content-Length and Content-Disposition
-    let stream = connect_10g_stream(sock_addr)?;
+    // Send HEAD request to inspect Content-Length and Content-Disposition
+    let stream = connect_stream(sock_addr)?;
     let mut reader = BufReader::new(stream);
     let head_req = format!(
-        "HEAD {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare-10g/0.1\r\nConnection: close\r\n\r\n",
+        "HEAD {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare/0.1\r\nConnection: close\r\n\r\n",
         parsed.path_and_query, parsed.host, parsed.port
     );
     reader.get_mut().write_all(head_req.as_bytes()).await?;
@@ -240,7 +284,11 @@ pub async fn run_parallel_download(
         .unwrap_or(0);
 
     if status_code != 200 && status_code != 206 {
-        anyhow::bail!("Server returned HTTP {} ({})", status_code, status_line.trim());
+        anyhow::bail!(
+            "Server returned HTTP {} ({})",
+            status_code,
+            status_line.trim()
+        );
     }
 
     let mut content_length: Option<u64> = None;
@@ -268,26 +316,20 @@ pub async fn run_parallel_download(
         }
     }
 
-    let dest_dir = output_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(default_downloads_dir);
-    std::fs::create_dir_all(&dest_dir)?;
     let dest_path = dest_dir.join(&filename);
-
     let total_size = content_length.unwrap_or(0);
-    println!(" File Name   : {}", filename);
+    println!("File        : {}", filename);
     println!(
-        " File Size   : {}",
+        "Size        : {}",
         if total_size > 0 {
             format_bytes(total_size)
         } else {
-            "Stream (unknown size)".to_string()
+            "Unknown (stream)".to_string()
         }
     );
-    println!(" Saving To   : {}", dest_path.display());
+    println!("Destination : {}", dest_path.display());
     println!("------------------------------------------------------------");
 
-    // Pre-allocate destination file
     {
         let file = OpenOptions::new()
             .create(true)
@@ -304,7 +346,6 @@ pub async fn run_parallel_download(
     let start_instant = Instant::now();
     let bytes_downloaded = Arc::new(AtomicU64::new(0));
 
-    // Spawn progress reporter
     let bytes_reporter = Arc::clone(&bytes_downloaded);
     let progress_handle = tokio::spawn(async move {
         let mut last_bytes = 0u64;
@@ -324,7 +365,7 @@ pub async fn run_parallel_download(
             if total_size > 0 {
                 let pct = ((curr as f64 / total_size as f64) * 100.0).min(100.0);
                 print!(
-                    "\r 🚀 {:5.1}% | {} / {} | {}          ",
+                    "\r[{:5.1}%] {} / {} | {}          ",
                     pct,
                     format_bytes(curr),
                     format_bytes(total_size),
@@ -332,7 +373,7 @@ pub async fn run_parallel_download(
                 );
             } else {
                 print!(
-                    "\r 🚀 Downloaded {} | {}          ",
+                    "\rDownloaded {} | {}          ",
                     format_bytes(curr),
                     format_speed_bps(bps)
                 );
@@ -342,7 +383,6 @@ pub async fn run_parallel_download(
     });
 
     if total_size == 0 {
-        // Single stream download if size is unknown (e.g. streaming .zip/.tar archive)
         download_range_worker(
             sock_addr,
             parsed.host.clone(),
@@ -354,7 +394,6 @@ pub async fn run_parallel_download(
         )
         .await?;
     } else {
-        // Split file across `num_conns` parallel TCP Range streams
         let actual_conns = if total_size < 4 * 1024 * 1024 {
             1
         } else {
@@ -402,16 +441,14 @@ pub async fn run_parallel_download(
     let avg_bps = (final_bytes as f64) / elapsed;
 
     println!(
-        "\r ✅ 100.0% | {} in {:.2}s | Avg: {}                    ",
+        "\r[100.0%] {} in {:.2}s | Avg: {}                    ",
         format_bytes(final_bytes),
         elapsed,
         format_speed_bps(avg_bps)
     );
-    println!("============================================================");
-    println!(" Saved to: {}", dest_path.display());
+    println!("Saved: {}", dest_path.display());
 
-    // If launched from browser protocol (`fastshare://`), pause briefly so the user can see the result
-    if target_url.trim().starts_with("fastshare://") {
+    if is_protocol_launch {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
@@ -427,23 +464,22 @@ async fn download_range_worker(
     range: Option<(u64, u64)>,
     bytes_counter: Arc<AtomicU64>,
 ) -> Result<()> {
-    let stream = connect_10g_stream(sock_addr)?;
+    let stream = connect_stream(sock_addr)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, stream);
 
     let req = match range {
         Some((start, end)) => format!(
-            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare-10g/0.1\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare/0.1\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
             path_and_query, host, port, start, end
         ),
         None => format!(
-            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare-10g/0.1\r\nConnection: close\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: fastshare/0.1\r\nConnection: close\r\n\r\n",
             path_and_query, host, port
         ),
     };
 
     reader.get_mut().write_all(req.as_bytes()).await?;
 
-    // Read HTTP response headers
     let mut status_line = String::new();
     reader.read_line(&mut status_line).await?;
     let status_code: u16 = status_line
@@ -468,7 +504,7 @@ async fn download_range_worker(
         file.seek(SeekFrom::Start(start)).await?;
     }
 
-    let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB write buffer per worker
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {

@@ -6,8 +6,8 @@ authors = ["hironichu"]
 license = "MIT"
 repository = "https://github.com/hironichu/fastshare"
 readme = "README.md"
-description = "Ultra-fast 10GbE direct folder sharing server with UPnP, in-browser 16x parallel downloader, password/token auth, quotas, IP blacklist, and live TUI dashboard"
-keywords = ["10gbe", "fileshare", "upnp", "http2", "tui"]
+description = "High-throughput HTTP/2 file sharing server with UPnP IGD, HMAC authentication, rate/download quotas, and live TUI telemetry"
+keywords = ["http2", "fileshare", "upnp", "network", "tui"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 
 [dependencies]

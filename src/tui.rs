@@ -274,9 +274,9 @@ fn draw_info_panel(f: &mut ratatui::Frame, area: Rect, metrics: &Arc<Metrics>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " ⚡ FastShare 10GbE — Secure Direct Folder Server ",
+            " FastShare — HTTP/2 File Server ",
             Style::default()
-                .fg(Color::LightBlue)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -428,9 +428,9 @@ fn draw_logs_panel(
 ) {
     if *input_mode != InputMode::Normal {
         let title = if *input_mode == InputMode::BanIp {
-            " 🚫 Ban IP or CIDR (Enter to confirm, Esc to cancel) "
+            " Ban IP or CIDR (Enter to confirm, Esc to cancel) "
         } else {
-            " ✅ Unban IP or CIDR (Enter to confirm, Esc to cancel) "
+            " Unban IP or CIDR (Enter to confirm, Esc to cancel) "
         };
         let prompt = Paragraph::new(vec![
             Line::from(""),

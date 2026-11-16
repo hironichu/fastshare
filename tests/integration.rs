@@ -191,7 +191,7 @@ async fn test_password_protection_and_session_auth() {
         &resp_unauth.into_body().collect().await.unwrap().to_bytes(),
     )
     .to_string();
-    assert!(login_html.contains("Password Protected Share"));
+    assert!(login_html.contains("Authentication Required"));
 
     // 2. Wrong password POST returns 401
     let req_bad_pw = with_connect_info(
