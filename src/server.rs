@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use chrono::{DateTime, Local};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -38,7 +38,23 @@ pub struct AppState {
 #[derive(Deserialize, Default, Clone)]
 pub struct RequestQuery {
     pub archive: Option<String>,
+    pub manifest: Option<String>,
     pub key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ManifestFile {
+    pub path: String,
+    pub url: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FolderManifest {
+    pub root: String,
+    pub total_files: usize,
+    pub total_bytes: u64,
+    pub files: Vec<ManifestFile>,
 }
 
 #[derive(Deserialize)]
@@ -472,6 +488,17 @@ async fn serve_entry(
     };
 
     if metadata.is_dir() {
+        if let Some(manifest_fmt) = query.manifest.as_deref() {
+            return serve_directory_manifest(
+                state,
+                client_addr,
+                headers,
+                &target_path,
+                &clean_rel,
+                manifest_fmt,
+            )
+            .await;
+        }
         if let Some(archive_fmt) = query.archive.as_deref() {
             if let Err(resp) = check_download_gates(state, client_addr, &format!("archive:{}", clean_rel)) {
                 return resp;
@@ -488,7 +515,18 @@ async fn serve_entry(
                 }
             }
         }
-        return serve_directory_ui(state, client_addr, headers, &target_path, &clean_rel).await;
+        if method == Method::HEAD {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header("X-FastShare-Type", "directory")
+                .body(Body::empty())
+                .unwrap();
+        }
+        let mut resp = serve_directory_ui(state, client_addr, headers, &target_path, &clean_rel).await;
+        resp.headers_mut()
+            .insert("X-FastShare-Type", HeaderValue::from_static("directory"));
+        return resp;
     }
 
     if method != Method::HEAD {
@@ -639,6 +677,101 @@ async fn serve_directory_ui(
 
     let html = render_directory_page(&ctx, &entries);
     Html(html).into_response()
+}
+
+/// Serve a recursive uncompressed file manifest (`?manifest=1` / `?manifest=json` or `?manifest=aria2`)
+/// so clients and the parallel browser engine can download an entire folder tree directly without compression.
+async fn serve_directory_manifest(
+    state: &AppState,
+    client_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    dir_path: &Path,
+    clean_rel: &str,
+    format: &str,
+) -> Response {
+    let raw_files = collect_files_recursively(&state.root_dir, dir_path, state.allow_hidden).await;
+    let sec = &state.metrics.security;
+    let ticket = if sec.requires_password() {
+        client_addr.map(|a| sec.create_client_ticket(a.ip()))
+    } else {
+        None
+    };
+
+    let root_name = if clean_rel.is_empty() {
+        state
+            .root_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "shared".to_string())
+    } else {
+        Path::new(clean_rel)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| clean_rel.to_string())
+    };
+
+    let mut files = Vec::with_capacity(raw_files.len());
+    let mut total_bytes = 0u64;
+
+    for (full_path, rel_within_dir) in raw_files {
+        let size = tokio::fs::metadata(&full_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        total_bytes = total_bytes.saturating_add(size);
+
+        let full_rel = if clean_rel.is_empty() {
+            rel_within_dir.clone()
+        } else {
+            format!("{}/{}", clean_rel, rel_within_dir)
+        };
+        let encoded = format!("/{}/{}", state.token, encode_path_segments(&full_rel));
+        let url = match &ticket {
+            Some(t) if !t.is_empty() => format!("{}?key={}", encoded, t),
+            _ => encoded,
+        };
+
+        files.push(ManifestFile {
+            path: rel_within_dir,
+            url,
+            size,
+        });
+    }
+
+    match format {
+        "aria2" => {
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            let mut out = String::new();
+            for f in &files {
+                out.push_str(&format!("http://{}{}\n  out={}\n", host, f.url, f.path));
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .header("X-FastShare-Type", "manifest-aria2")
+                .body(Body::from(out))
+                .unwrap()
+        }
+        "1" | "json" => {
+            let manifest = FolderManifest {
+                root: root_name,
+                total_files: files.len(),
+                total_bytes,
+                files,
+            };
+            let json = serde_json::to_string(&manifest).unwrap_or_else(|_| "{}".to_string());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                .header("X-FastShare-Type", "manifest-json")
+                .body(Body::from(json))
+                .unwrap()
+        }
+        _ => (StatusCode::BAD_REQUEST, "Unsupported manifest format (use 1, json, or aria2)").into_response(),
+    }
 }
 
 /// High-throughput 10GbE file streaming with HTTP/1.1 & HTTP/2 Range support

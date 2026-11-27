@@ -293,27 +293,21 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
         }
     }
 
-    let raw_zip_url = if ctx.rel_dir.is_empty() {
-        format!("{}/?archive=zip", base_prefix)
+    let dir_base_url = if ctx.rel_dir.is_empty() {
+        format!("{}/", base_prefix)
     } else {
-        format!(
-            "{}/{}?archive=zip",
-            base_prefix,
-            encode_path_segments(&ctx.rel_dir)
-        )
+        format!("{}/{}/", base_prefix, encode_path_segments(&ctx.rel_dir))
     };
-    let raw_tar_url = if ctx.rel_dir.is_empty() {
-        format!("{}/?archive=tar", base_prefix)
-    } else {
-        format!(
-            "{}/{}?archive=tar",
-            base_prefix,
-            encode_path_segments(&ctx.rel_dir)
-        )
-    };
+    let raw_zip_url = format!("{}?archive=zip", dir_base_url);
+    let raw_tar_url = format!("{}?archive=tar", dir_base_url);
+    let raw_manifest_url = format!("{}?manifest=1", dir_base_url);
+    let raw_aria2_manifest_url = format!("{}?manifest=aria2", dir_base_url);
 
     let zip_url = append_ticket(&raw_zip_url, &ctx.dl_ticket);
     let tar_url = append_ticket(&raw_tar_url, &ctx.dl_ticket);
+    let manifest_url = append_ticket(&raw_manifest_url, &ctx.dl_ticket);
+    let aria2_manifest_url = append_ticket(&raw_aria2_manifest_url, &ctx.dl_ticket);
+    let dir_ticket_url = append_ticket(&dir_base_url, &ctx.dl_ticket);
 
     let mut total_files = 0usize;
     let mut total_dirs = 0usize;
@@ -412,8 +406,19 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
                 append_ticket(&format!("{}?archive=zip", entry.rel_url), &ctx.dl_ticket);
             let folder_tar =
                 append_ticket(&format!("{}?archive=tar", entry.rel_url), &ctx.dl_ticket);
+            let folder_manifest = html_escape(&append_ticket(
+                &format!("{}?manifest=1", entry.rel_url),
+                &ctx.dl_ticket,
+            ));
+            let folder_aria2 = html_escape(&append_ticket(
+                &format!("{}?manifest=aria2", entry.rel_url),
+                &ctx.dl_ticket,
+            ));
+            let folder_proto = html_escape(&append_ticket(&entry.rel_url, &ctx.dl_ticket));
             format!(
-                r#"<a href="{folder_zip}" class="btn btn-sm">.zip</a>
+                r#"<button type="button" class="btn btn-sm btn-primary" data-manifest="{folder_manifest}" data-name="{escaped_name}" onclick="handleParallelFolderBtn(this)" title="Download all files in folder uncompressed via parallel streams">Parallel</button>
+                   <button type="button" class="btn btn-sm" data-manifest="{folder_manifest}" data-aria2="{folder_aria2}" data-proto="{folder_proto}" data-name="{escaped_name}" onclick="handleAria2FolderBtn(this)" title="Download folder uncompressed via aria2c (RPC / URI / CLI)">aria2c</button>
+                   <a href="{folder_zip}" class="btn btn-sm">.zip</a>
                    <a href="{folder_tar}" class="btn btn-sm">.tar</a>"#
             )
         } else {
@@ -801,9 +806,10 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
     </div>
     <div class="toolbar">
       <input type="text" id="filter" class="search-input" placeholder="Filter... (/)" oninput="filterRows(this.value)">
+      <button type="button" class="btn btn-primary" data-manifest="{manifest_url}" data-name="folder" onclick="handleParallelFolderBtn(this)" title="Download all files in this directory recursively without compression using parallel streams">Download All (Parallel)</button>
+      <button type="button" class="btn" data-manifest="{manifest_url}" data-aria2="{aria2_manifest_url}" data-proto="{dir_ticket_url}" data-name="folder" onclick="handleAria2FolderBtn(this)" title="Download all files uncompressed via aria2c (dispatches to local RPC / URI handler and copies recursive command)">aria2c Folder</button>
       <a href="{zip_url}" class="btn">Archive (.zip)</a>
       <a href="{tar_url}" class="btn">Archive (.tar)</a>
-      <button type="button" class="btn" onclick="copyBatchAria2()">Batch aria2c</button>
       {logout_btn}
     </div>
   </div>
@@ -1196,6 +1202,333 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
   }}
 }}
 
+function handleParallelFolderBtn(btn) {{
+  const manifestUrl = btn.getAttribute('data-manifest') || '';
+  const name = btn.getAttribute('data-name') || 'folder';
+  startParallelFolderDownload(manifestUrl, name);
+}}
+
+async function handleAria2FolderBtn(btn) {{
+  const manifestUrl = btn.getAttribute('data-manifest') || '';
+  const aria2Url = btn.getAttribute('data-aria2') || '';
+  const protoUrl = btn.getAttribute('data-proto') || '';
+  const name = btn.getAttribute('data-name') || 'folder';
+
+  const fullAria2Url = window.location.origin + aria2Url;
+  const cmd = `curl -sSL "${{fullAria2Url}}" | aria2c -i - -j 4 -x 16 -s 16 -k 4M --file-allocation=none`;
+  copyText(cmd, `aria2c recursive folder command copied (${{name}})`);
+
+  // 1. Try dispatching all files as a single JSON-RPC batch to local aria2c daemon
+  for (const rpcPort of [6800, 16800]) {{
+    try {{
+      const probeCtrl = new AbortController();
+      const probeTimer = setTimeout(() => probeCtrl.abort(), 400);
+      const probeRes = await fetch(`http://127.0.0.1:${{rpcPort}}/jsonrpc`, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ jsonrpc: '2.0', id: 'probe', method: 'aria2.getVersion', params: [] }}),
+        signal: probeCtrl.signal
+      }});
+      clearTimeout(probeTimer);
+      if (probeRes.ok) {{
+        const mRes = await fetch(manifestUrl);
+        if (mRes.ok) {{
+          const manifest = await mRes.json();
+          if (manifest.files && manifest.files.length) {{
+            const batch = manifest.files.map((f, idx) => ({{
+              jsonrpc: '2.0',
+              id: 'fs-' + idx,
+              method: 'aria2.addUri',
+              params: [
+                [window.location.origin + f.url],
+                {{
+                  out: `${{manifest.root || name}}/${{f.path}}`,
+                  split: '16',
+                  'max-connection-per-server': '16',
+                  'min-split-size': '4M',
+                  'file-allocation': 'none'
+                }}
+              ]
+            }}));
+            const rpcRes = await fetch(`http://127.0.0.1:${{rpcPort}}/jsonrpc`, {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify(batch)
+            }});
+            if (rpcRes.ok) {{
+              showToast(`Dispatched ${{manifest.files.length}} files to local aria2c RPC (:${{rpcPort}})`);
+              return;
+            }}
+          }}
+        }}
+      }}
+    }} catch (_) {{}}
+  }}
+
+  // 2. Trigger `fastshare://host:port/dir` URI handler (spawns aria2c / built-in folder sync if registered)
+  if (protoUrl) {{
+    const hostAndPath = window.location.host + protoUrl;
+    const iframe = document.getElementById('proto-loader');
+    if (iframe) {{
+      iframe.src = `fastshare://${{hostAndPath}}`;
+    }}
+  }}
+}}
+
+async function createNestedFileWritable(rootDirHandle, relPath) {{
+  const parts = relPath.split('/').filter(Boolean);
+  let curDir = rootDirHandle;
+  for (let i = 0; i < parts.length - 1; i++) {{
+    curDir = await curDir.getDirectoryHandle(parts[i], {{ create: true }});
+  }}
+  const fileHandle = await curDir.getFileHandle(parts[parts.length - 1], {{ create: true }});
+  return await fileHandle.createWritable();
+}}
+
+async function startParallelFolderDownload(manifestUrl, folderName) {{
+  if (activeTransferAbort) {{
+    showToast('Transfer already in progress');
+    return;
+  }}
+
+  let manifest;
+  try {{
+    const res = await fetch(manifestUrl);
+    if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+    manifest = await res.json();
+  }} catch (err) {{
+    showToast('Failed to load folder manifest: ' + (err.message || err));
+    return;
+  }}
+
+  const files = manifest.files || [];
+  if (!files.length) {{
+    showToast('Directory contains no files');
+    return;
+  }}
+
+  // Prefer File System Access API (showDirectoryPicker) to write nested files straight to disk uncompressed
+  let rootDirHandle = null;
+  if (typeof window.showDirectoryPicker === 'function') {{
+    try {{
+      const picked = await window.showDirectoryPicker({{ mode: 'readwrite' }});
+      rootDirHandle = await picked.getDirectoryHandle(manifest.root || folderName || 'fastshare', {{ create: true }});
+    }} catch (err) {{
+      if (err && err.name === 'AbortError') return;
+      rootDirHandle = null;
+    }}
+  }}
+
+  const abortCtrl = new AbortController();
+  activeTransferAbort = abortCtrl;
+
+  const hud = document.getElementById('transfer-hud');
+  const hudTitle = document.getElementById('hud-filename');
+  const hudMode = document.getElementById('hud-mode');
+  const hudProgTxt = document.getElementById('hud-progress-txt');
+  const hudSpeed = document.getElementById('hud-speed');
+  const hudBar = document.getElementById('hud-bar');
+  const workerCells = document.querySelectorAll('#hud-workers .worker-cell');
+
+  const totalBytes = manifest.total_bytes || files.reduce((acc, f) => acc + (f.size || 0), 0);
+  hudBar.style.width = '0%';
+  hud.classList.add('active');
+
+  const origins = await resolveShardedOrigins(files[0].url);
+  const numWorkers = origins.length > 1 ? 16 : 6;
+  hudMode.textContent = rootDirHandle
+    ? `${{numWorkers}}x Folder Sync -> Disk`
+    : `${{numWorkers}}x Parallel Folder`;
+
+  let totalBytesReceived = 0;
+  let completedFiles = 0;
+  const startTime = performance.now();
+  let lastTickTime = startTime;
+  let lastTickBytes = 0;
+
+  const speedTimer = setInterval(() => {{
+    const now = performance.now();
+    const dt = (now - lastTickTime) / 1000;
+    if (dt >= 0.25) {{
+      const db = totalBytesReceived - lastTickBytes;
+      const bps = db / dt;
+      lastTickTime = now;
+      lastTickBytes = totalBytesReceived;
+      hudSpeed.textContent = formatSpeedJs(bps);
+    }}
+    const pct = totalBytes > 0 ? Math.min(100, (totalBytesReceived / totalBytes) * 100) : ((completedFiles / files.length) * 100);
+    hudBar.style.width = pct.toFixed(1) + '%';
+    hudProgTxt.textContent = `${{pct.toFixed(1)}}% (${{formatBytesJs(totalBytesReceived)}} / ${{formatBytesJs(totalBytes)}}) — ${{completedFiles}}/${{files.length}} files`;
+  }}, 200);
+
+  async function downloadOneFileParallel(fileObj) {{
+    const fileSize = fileObj.size || 0;
+    const fileName = fileObj.path.split('/').pop() || 'download.bin';
+    hudTitle.textContent = `[${{completedFiles + 1}}/${{files.length}}] ${{fileObj.path}}`;
+
+    let writable = null;
+    if (rootDirHandle) {{
+      writable = await createNestedFileWritable(rootDirHandle, fileObj.path);
+    }}
+
+    if (fileSize === 0) {{
+      if (writable) {{
+        await writable.close();
+      }} else {{
+        const blob = new Blob([], {{ type: 'application/octet-stream' }});
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      }}
+      completedFiles++;
+      return;
+    }}
+
+    const chunkSize = fileSize >= 64 * 1048576 ? 8 * 1048576 : 2 * 1048576;
+    const numChunks = Math.ceil(fileSize / chunkSize);
+    const completedChunks = new Array(numChunks);
+    let nextChunkToAssign = 0;
+    let nextChunkToWrite = 0;
+    let isWriting = false;
+
+    async function flushQueue() {{
+      if (!writable || isWriting) return;
+      isWriting = true;
+      try {{
+        while (nextChunkToWrite < numChunks && completedChunks[nextChunkToWrite]) {{
+          const data = completedChunks[nextChunkToWrite];
+          completedChunks[nextChunkToWrite] = null;
+          await writable.write(data);
+          nextChunkToWrite++;
+        }}
+      }} finally {{
+        isWriting = false;
+      }}
+    }}
+
+    async function runChunkWorker(workerIdx) {{
+      const cell = workerCells[workerIdx % workerCells.length];
+      while (!abortCtrl.signal.aborted) {{
+        if (writable && (nextChunkToAssign - nextChunkToWrite) >= 24) {{
+          await new Promise(r => setTimeout(r, 30));
+          continue;
+        }}
+        const chunkIdx = nextChunkToAssign++;
+        if (chunkIdx >= numChunks) break;
+
+        const startByte = chunkIdx * chunkSize;
+        const endByte = Math.min(fileSize - 1, startByte + chunkSize - 1);
+        const origin = origins[chunkIdx % origins.length];
+
+        if (cell) cell.classList.add('busy');
+        try {{
+          const resp = await fetch(origin + fileObj.url, {{
+            method: 'GET',
+            mode: 'cors',
+            headers: {{ 'Range': `bytes=${{startByte}}-${{endByte}}` }},
+            signal: abortCtrl.signal
+          }});
+          if (!resp.ok && resp.status !== 206) {{
+            throw new Error(`HTTP ${{resp.status}} on ${{fileObj.path}}`);
+          }}
+          const reader = resp.body.getReader();
+          const expectedLen = endByte - startByte + 1;
+          const chunkBuf = new Uint8Array(expectedLen);
+          let offset = 0;
+          while (true) {{
+            const {{ done, value }} = await reader.read();
+            if (done) break;
+            chunkBuf.set(value, offset);
+            offset += value.byteLength;
+            totalBytesReceived += value.byteLength;
+          }}
+          completedChunks[chunkIdx] = offset === expectedLen ? chunkBuf : chunkBuf.subarray(0, offset);
+          if (writable) await flushQueue();
+        }} finally {{
+          if (cell) cell.classList.remove('busy');
+        }}
+      }}
+    }}
+
+    try {{
+      const workers = [];
+      for (let i = 0; i < Math.min(numWorkers, numChunks); i++) {{
+        workers.push(runChunkWorker(i));
+      }}
+      await Promise.all(workers);
+
+      if (writable) {{
+        await flushQueue();
+        await writable.close();
+      }} else {{
+        const blob = new Blob(completedChunks, {{ type: 'application/octet-stream' }});
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        // Brief pause between browser multi-file saves so Chromium does not throttle downloads
+        await new Promise(r => setTimeout(r, 140));
+      }}
+      completedFiles++;
+    }} catch (err) {{
+      if (writable) {{
+        try {{ await writable.abort(); }} catch (_) {{}}
+      }}
+      throw err;
+    }}
+  }}
+
+  try {{
+    // Download small files concurrently (up to 4 at once) and large files with full 16-stream range concurrency
+    const smallFiles = files.filter(f => (f.size || 0) < 4 * 1048576);
+    const largeFiles = files.filter(f => (f.size || 0) >= 4 * 1048576);
+
+    if (smallFiles.length) {{
+      let nextIdx = 0;
+      const smallConcurrency = Math.min(rootDirHandle ? 6 : 3, smallFiles.length);
+      const smallWorkers = [];
+      for (let i = 0; i < smallConcurrency; i++) {{
+        smallWorkers.push((async () => {{
+          while (!abortCtrl.signal.aborted) {{
+            const idx = nextIdx++;
+            if (idx >= smallFiles.length) break;
+            await downloadOneFileParallel(smallFiles[idx]);
+          }}
+        }})());
+      }}
+      await Promise.all(smallWorkers);
+    }}
+
+    for (const lf of largeFiles) {{
+      if (abortCtrl.signal.aborted) break;
+      await downloadOneFileParallel(lf);
+    }}
+
+    if (!abortCtrl.signal.aborted) {{
+      const elapsedSec = Math.max(0.01, (performance.now() - startTime) / 1000);
+      const avgBps = totalBytesReceived / elapsedSec;
+      showToast(`Downloaded ${{completedFiles}} files in ${{elapsedSec.toFixed(1)}}s (${{formatSpeedJs(avgBps)}})`);
+    }}
+  }} catch (err) {{
+    if (!abortCtrl.signal.aborted) {{
+      showToast('Folder transfer error: ' + (err.message || err));
+    }}
+  }} finally {{
+    clearInterval(speedTimer);
+    activeTransferAbort = null;
+    setTimeout(() => hud.classList.remove('active'), 1800);
+  }}
+}}
+
 function filterRows(q) {{
   const needle = q.toLowerCase();
   document.querySelectorAll('#file-tbody tr.row').forEach(tr => {{
@@ -1264,6 +1597,9 @@ if (ttlEl) {{
         breadcrumbs_html = breadcrumbs_html,
         zip_url = zip_url,
         tar_url = tar_url,
+        manifest_url = html_escape(&manifest_url),
+        aria2_manifest_url = html_escape(&aria2_manifest_url),
+        dir_ticket_url = html_escape(&dir_ticket_url),
         logout_btn = logout_btn,
         telemetry_html = telemetry_html,
         rows_html = rows_html,

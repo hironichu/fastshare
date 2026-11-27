@@ -348,6 +348,53 @@ async fn test_ttl_expiration() {
 }
 
 #[tokio::test]
+async fn test_directory_manifest_json_and_aria2() {
+    let (_dir, _state, app) = setup_test_app();
+
+    // 1. JSON recursive manifest (?manifest=1)
+    let req_json = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/?manifest=1")
+            .header(header::HOST, "127.0.0.1:24567")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp_json = app.clone().oneshot(req_json).await.unwrap();
+    assert_eq!(resp_json.status(), StatusCode::OK);
+    let body = resp_json.into_body().collect().await.unwrap().to_bytes();
+    let manifest: fastshare::server::FolderManifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(manifest.total_files, 3); // large_sample.bin, second_file.txt, subfolder/hello.txt (no .hidden_secret)
+    assert!(manifest.files.iter().any(|f| f.path == "subfolder/hello.txt"));
+    assert!(!manifest.files.iter().any(|f| f.path.contains(".hidden_secret")));
+
+    // 2. aria2 input file manifest (?manifest=aria2)
+    let req_aria2 = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/?manifest=aria2")
+            .header(header::HOST, "127.0.0.1:24567")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp_aria2 = app.clone().oneshot(req_aria2).await.unwrap();
+    assert_eq!(resp_aria2.status(), StatusCode::OK);
+    let text = String::from_utf8_lossy(&resp_aria2.into_body().collect().await.unwrap().to_bytes()).to_string();
+    assert!(text.contains("http://127.0.0.1:24567/secret123token/subfolder/hello"));
+    assert!(text.contains("  out=subfolder/hello.txt"));
+
+    // 3. Directory HEAD exposes X-FastShare-Type: directory
+    let req_head = with_connect_info(
+        Request::builder()
+            .method(Method::HEAD)
+            .uri("/secret123token/subfolder")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp_head = app.oneshot(req_head).await.unwrap();
+    assert_eq!(resp_head.status(), StatusCode::OK);
+    assert_eq!(resp_head.headers().get("X-FastShare-Type").unwrap(), "directory");
+}
+
+#[tokio::test]
 async fn test_lan_ip_detection_skips_cgnat() {
     let local_ip = fastshare::net::detect_local_ip();
     println!("Detected LAN IP: {}", local_ip);
