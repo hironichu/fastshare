@@ -43,7 +43,10 @@ fn create_10g_listener(addr: SocketAddr) -> Result<TcpListener> {
 }
 
 /// Bind to either a user-specified port or a cryptographically randomized high port in `10000..=60000`
-fn bind_10g_listener(bind_ip: &str, requested_port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
+fn bind_10g_listener(
+    bind_ip: &str,
+    requested_port: Option<u16>,
+) -> Result<(TcpListener, SocketAddr)> {
     match requested_port {
         Some(port) if port > 0 => {
             let addr: SocketAddr = format!("{}:{}", bind_ip, port)
@@ -109,14 +112,12 @@ async fn main() -> Result<()> {
 
     let ttl = match &args.ttl {
         Some(s) => Some(
-            parse_duration_str(s)
-                .map_err(|e| anyhow::anyhow!("Invalid --ttl '{}': {}", s, e))?,
+            parse_duration_str(s).map_err(|e| anyhow::anyhow!("Invalid --ttl '{}': {}", s, e))?,
         ),
         None => None,
     };
 
-    let initial_blacklist =
-        load_blacklist_rules(&args.blacklist, args.blacklist_file.as_deref())?;
+    let initial_blacklist = load_blacklist_rules(&args.blacklist, args.blacklist_file.as_deref())?;
 
     let max_bytes = args
         .max_gb

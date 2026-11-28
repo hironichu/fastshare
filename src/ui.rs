@@ -8,6 +8,7 @@ pub struct FileEntry {
     pub size: u64,
     pub modified: String,
     pub modified_ts: u64,
+    pub version_ts: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -22,6 +23,7 @@ pub struct UiContext {
     pub max_downloads: Option<u64>,
     pub bytes_used: u64,
     pub max_bytes: Option<u64>,
+    pub max_concurrent: usize,
 }
 
 fn append_ticket(url: &str, ticket: &Option<String>) -> String {
@@ -416,15 +418,17 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
             ));
             let folder_proto = html_escape(&append_ticket(&entry.rel_url, &ctx.dl_ticket));
             format!(
-                r#"<button type="button" class="btn btn-sm btn-primary" data-manifest="{folder_manifest}" data-name="{escaped_name}" onclick="handleParallelFolderBtn(this)" title="Download all files in folder uncompressed via parallel streams">Parallel</button>
+                r#"<button type="button" class="btn btn-sm btn-primary" data-manifest="{folder_manifest}" data-proto="{folder_proto}" data-name="{escaped_name}" onclick="handleParallelFolderBtn(this)" title="Choose one destination folder and download directly">Folder</button>
+                   <button type="button" class="btn btn-sm" data-manifest="{folder_manifest}" data-name="{escaped_name}" onclick="handleBrowserFolderBtn(this)" title="Use separate browser downloads without selecting a writable folder">Browser</button>
                    <button type="button" class="btn btn-sm" data-manifest="{folder_manifest}" data-aria2="{folder_aria2}" data-proto="{folder_proto}" data-name="{escaped_name}" onclick="handleAria2FolderBtn(this)" title="Download folder uncompressed via aria2c (RPC / URI / CLI)">aria2c</button>
-                   <a href="{folder_zip}" class="btn btn-sm">.zip</a>
-                   <a href="{folder_tar}" class="btn btn-sm">.tar</a>"#
+                   <a href="{folder_zip}" class="btn btn-sm" title="Uncompressed archive. Extraction requires additional free space.">.zip</a>
+                   <a href="{folder_tar}" class="btn btn-sm" title="Uncompressed archive. Extraction requires additional free space.">.tar</a>"#
             )
         } else {
+            let etag = format!("&quot;{:x}-{:x}&quot;", entry.size, entry.version_ts);
             format!(
                 r#"<a href="{dl_url}" download class="btn btn-sm btn-primary">Download</a>
-                   <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" data-name="{escaped_name}" data-size="{file_size}" onclick="handleParallelBtn(this)" title="Concurrent multi-stream browser range transfer">Parallel</button>
+                   <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" data-name="{escaped_name}" data-size="{file_size}" data-etag="{etag}" onclick="handleParallelBtn(this)" title="Concurrent resumable browser range transfer">Parallel</button>
                    <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" data-name="{escaped_name}" onclick="handleAria2Btn(this, event)" title="Launch in aria2c (via RPC / URI handler) and copy CLI command">aria2c</button>
                    <button type="button" class="btn btn-sm" data-rel="{escaped_rel_url}" onclick="handleCopyLinkBtn(this)" title="Copy direct URL">Copy URL</button>"#,
                 dl_url = ticketed_rel_url,
@@ -457,9 +461,8 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
     }
 
     if entries.is_empty() {
-        rows_html.push_str(
-            r#"<tr><td colspan="5" class="empty-cell">Directory is empty.</td></tr>"#,
-        );
+        rows_html
+            .push_str(r#"<tr><td colspan="5" class="empty-cell">Directory is empty.</td></tr>"#);
     }
 
     let batch_json = serde_json::to_string(&batch_urls_js).unwrap_or_else(|_| "[]".to_string());
@@ -806,10 +809,11 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
     </div>
     <div class="toolbar">
       <input type="text" id="filter" class="search-input" placeholder="Filter... (/)" oninput="filterRows(this.value)">
-      <button type="button" class="btn btn-primary" data-manifest="{manifest_url}" data-name="folder" onclick="handleParallelFolderBtn(this)" title="Download all files in this directory recursively without compression using parallel streams">Download All (Parallel)</button>
+      <button type="button" class="btn btn-primary" data-manifest="{manifest_url}" data-proto="{dir_ticket_url}" data-name="folder" onclick="handleParallelFolderBtn(this)" title="Choose one destination folder and download directly without archive extraction">Choose Folder &amp; Download</button>
+      <button type="button" class="btn" data-manifest="{manifest_url}" data-name="folder" onclick="handleBrowserFolderBtn(this)" title="Use separate browser downloads without selecting a writable folder">Browser Downloads</button>
       <button type="button" class="btn" data-manifest="{manifest_url}" data-aria2="{aria2_manifest_url}" data-proto="{dir_ticket_url}" data-name="folder" onclick="handleAria2FolderBtn(this)" title="Download all files uncompressed via aria2c (dispatches to local RPC / URI handler and copies recursive command)">aria2c Folder</button>
-      <a href="{zip_url}" class="btn">Archive (.zip)</a>
-      <a href="{tar_url}" class="btn">Archive (.tar)</a>
+      <a href="{zip_url}" class="btn" title="Extracting requires approximately the archive size in additional free space.">ZIP (uncompressed)</a>
+      <a href="{tar_url}" class="btn" title="Extracting requires approximately the archive size in additional free space.">TAR (uncompressed)</a>
       {logout_btn}
     </div>
   </div>
@@ -864,6 +868,7 @@ pub fn render_directory_page(ctx: &UiContext, entries: &[FileEntry]) -> String {
 
 <script>
 const BATCH_FILES = {batch_json};
+const SERVER_MAX_CONCURRENT = {max_concurrent};
 let sortState = {{ col: 'name', asc: true }};
 let activeTransferAbort = null;
 
@@ -911,7 +916,8 @@ function handleParallelBtn(btn) {{
   const relUrl = btn.getAttribute('data-rel') || '';
   const name = btn.getAttribute('data-name') || 'download.bin';
   const size = parseInt(btn.getAttribute('data-size') || '0', 10);
-  startParallelDownload(relUrl, name, size);
+  const etag = btn.getAttribute('data-etag') || '';
+  startParallelDownload(relUrl, name, size, etag);
 }}
 
 // Triggers aria2c via local JSON-RPC (if running on 127.0.0.1:6800), invokes the registered
@@ -992,6 +998,55 @@ function formatSpeedJs(bps) {{
   return `${{(bits / 1e6).toFixed(1)}} Mbps (${{mib.toFixed(1)}} MiB/s)`;
 }}
 
+function resumeStorageKey(scope, relUrl) {{
+  const parsed = new URL(relUrl, window.location.origin);
+  parsed.searchParams.delete('key');
+  return `fastshare-${{scope}}:${{parsed.origin}}${{parsed.pathname}}`;
+}}
+
+function browserFolderDownloadName(relPath) {{
+  return relPath
+    .split('/')
+    .filter(Boolean)
+    .join('__')
+    .replace(/[\\:*?"<>|]/g, '_') || 'download.bin';
+}}
+
+function queueBrowserDownload(url, relPath) {{
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = browserFolderDownloadName(relPath);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}}
+
+async function fetchValidatedRange(url, startByte, endByte, signal, etag = '') {{
+  const expectedLength = endByte - startByte + 1;
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {{
+    try {{
+      const headers = {{ 'Range': `bytes=${{startByte}}-${{endByte}}` }};
+      if (etag) headers['If-Range'] = etag;
+      const resp = await fetch(url, {{ method: 'GET', mode: 'cors', headers, signal }});
+      const contentRange = resp.headers.get('Content-Range') || '';
+      if (resp.status !== 206 || !contentRange.startsWith(`bytes ${{startByte}}-${{endByte}}/`)) {{
+        throw new Error(`Invalid range response (HTTP ${{resp.status}})`);
+      }}
+      const data = new Uint8Array(await resp.arrayBuffer());
+      if (data.byteLength !== expectedLength) {{
+        throw new Error(`Short range response (${{data.byteLength}}/${{expectedLength}} bytes)`);
+      }}
+      return data;
+    }} catch (err) {{
+      if (signal.aborted) throw err;
+      lastError = err;
+      if (attempt < 2) await new Promise(r => setTimeout(r, 250 * (2 ** attempt)));
+    }}
+  }}
+  throw lastError || new Error('Range transfer failed');
+}}
+
 async function resolveShardedOrigins(relUrl) {{
   const host = window.location.hostname;
   const port = window.location.port ? `:${{window.location.port}}` : '';
@@ -1032,7 +1087,7 @@ function cancelParallelDownload() {{
   showToast('Transfer aborted');
 }}
 
-async function startParallelDownload(relUrl, fileName, totalSize) {{
+async function startParallelDownload(relUrl, fileName, totalSize, etag = '') {{
   if (activeTransferAbort) {{
     showToast('Transfer already in progress');
     return;
@@ -1042,15 +1097,33 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
     return;
   }}
 
+  const chunkSize = totalSize >= 64 * 1048576 ? 8 * 1048576 : 2 * 1048576;
+  const resumeKey = resumeStorageKey('file', relUrl);
+  let fileHandle = null;
   let fileWritable = null;
+  let resumeBytes = 0;
   if (typeof window.showSaveFilePicker === 'function') {{
     try {{
-      const handle = await window.showSaveFilePicker({{ suggestedName: fileName }});
-      fileWritable = await handle.createWritable();
+      fileHandle = await window.showSaveFilePicker({{ suggestedName: fileName }});
+      const existing = await fileHandle.getFile();
+      let saved = null;
+      try {{ saved = JSON.parse(localStorage.getItem(resumeKey) || 'null'); }} catch (_) {{}}
+      if (saved && saved.etag === etag && saved.totalSize === totalSize) {{
+        resumeBytes = Math.min(totalSize, Math.floor(existing.size / chunkSize) * chunkSize);
+      }}
+      fileWritable = await fileHandle.createWritable({{ keepExistingData: true }});
+      await fileWritable.truncate(resumeBytes);
+      await fileWritable.seek(resumeBytes);
     }} catch (err) {{
       if (err && err.name === 'AbortError') return;
       fileWritable = null;
     }}
+  }}
+
+  if (!fileWritable && totalSize > 256 * 1048576) {{
+    showToast('Using the browser download manager for this large file');
+    window.location.href = relUrl;
+    return;
   }}
 
   const abortCtrl = new AbortController();
@@ -1069,17 +1142,17 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
   hud.classList.add('active');
 
   const origins = await resolveShardedOrigins(relUrl);
-  const numWorkers = origins.length > 1 ? 16 : 6;
+  const preferredWorkers = origins.length > 1 ? 16 : 6;
+  const numWorkers = Math.max(1, Math.min(preferredWorkers, SERVER_MAX_CONCURRENT));
   hudMode.textContent = `${{numWorkers}}x Range Streams`;
 
-  const chunkSize = totalSize >= 64 * 1048576 ? 8 * 1048576 : 2 * 1048576;
   const numChunks = Math.ceil(totalSize / chunkSize);
 
   const completedChunks = new Array(numChunks);
-  let nextChunkToAssign = 0;
-  let nextChunkToWrite = 0;
+  let nextChunkToAssign = Math.floor(resumeBytes / chunkSize);
+  let nextChunkToWrite = nextChunkToAssign;
   let isWritingToDisk = false;
-  let bytesReceived = 0;
+  let bytesReceived = resumeBytes;
   const startTime = performance.now();
   let lastTickTime = startTime;
   let lastTickBytes = 0;
@@ -1108,6 +1181,14 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
         completedChunks[nextChunkToWrite] = null;
         await fileWritable.write(data);
         nextChunkToWrite++;
+        if (fileHandle && nextChunkToWrite < numChunks && nextChunkToWrite % 16 === 0) {{
+          await fileWritable.close();
+          try {{
+            localStorage.setItem(resumeKey, JSON.stringify({{ etag, totalSize }}));
+          }} catch (_) {{}}
+          fileWritable = await fileHandle.createWritable({{ keepExistingData: true }});
+          await fileWritable.seek(nextChunkToWrite * chunkSize);
+        }}
       }}
     }} finally {{
       isWritingToDisk = false;
@@ -1130,30 +1211,15 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
 
       if (cell) cell.classList.add('busy');
       try {{
-        const resp = await fetch(origin + relUrl, {{
-          method: 'GET',
-          mode: 'cors',
-          headers: {{ 'Range': `bytes=${{startByte}}-${{endByte}}` }},
-          signal: abortCtrl.signal
-        }});
-        if (!resp.ok && resp.status !== 206) {{
-          throw new Error(`HTTP ${{resp.status}}`);
-        }}
-
-        const reader = resp.body.getReader();
-        const expectedLen = endByte - startByte + 1;
-        const chunkBuf = new Uint8Array(expectedLen);
-        let offset = 0;
-
-        while (true) {{
-          const {{ done, value }} = await reader.read();
-          if (done) break;
-          chunkBuf.set(value, offset);
-          offset += value.byteLength;
-          bytesReceived += value.byteLength;
-        }}
-
-        completedChunks[chunkIdx] = offset === expectedLen ? chunkBuf : chunkBuf.subarray(0, offset);
+        const chunkBuf = await fetchValidatedRange(
+          origin + relUrl,
+          startByte,
+          endByte,
+          abortCtrl.signal,
+          etag
+        );
+        bytesReceived += chunkBuf.byteLength;
+        completedChunks[chunkIdx] = chunkBuf;
         if (fileWritable) {{
           await flushDiskQueue();
         }}
@@ -1173,6 +1239,9 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
     if (fileWritable) {{
       await flushDiskQueue();
       await fileWritable.close();
+      try {{
+        localStorage.setItem(resumeKey, JSON.stringify({{ etag, totalSize, complete: true }}));
+      }} catch (_) {{}}
     }} else {{
       const blob = new Blob(completedChunks, {{ type: 'application/octet-stream' }});
       const blobUrl = URL.createObjectURL(blob);
@@ -1204,8 +1273,27 @@ async function startParallelDownload(relUrl, fileName, totalSize) {{
 
 function handleParallelFolderBtn(btn) {{
   const manifestUrl = btn.getAttribute('data-manifest') || '';
+  const protoUrl = btn.getAttribute('data-proto') || '';
   const name = btn.getAttribute('data-name') || 'folder';
-  startParallelFolderDownload(manifestUrl, name);
+  if (typeof window.showDirectoryPicker === 'function') {{
+    startParallelFolderDownload(manifestUrl, name, false);
+    return;
+  }}
+  if (protoUrl) {{
+    const iframe = document.getElementById('proto-loader');
+    if (iframe) {{
+      iframe.src = `fastshare://${{window.location.host}}${{protoUrl}}`;
+      showToast('Opening the FastShare destination-folder picker');
+      return;
+    }}
+  }}
+  startParallelFolderDownload(manifestUrl, name, true);
+}}
+
+function handleBrowserFolderBtn(btn) {{
+  const manifestUrl = btn.getAttribute('data-manifest') || '';
+  const name = btn.getAttribute('data-name') || 'folder';
+  startParallelFolderDownload(manifestUrl, name, true);
 }}
 
 async function handleAria2FolderBtn(btn) {{
@@ -1275,17 +1363,16 @@ async function handleAria2FolderBtn(btn) {{
   }}
 }}
 
-async function createNestedFileWritable(rootDirHandle, relPath) {{
+async function getNestedFileHandle(rootDirHandle, relPath) {{
   const parts = relPath.split('/').filter(Boolean);
   let curDir = rootDirHandle;
   for (let i = 0; i < parts.length - 1; i++) {{
     curDir = await curDir.getDirectoryHandle(parts[i], {{ create: true }});
   }}
-  const fileHandle = await curDir.getFileHandle(parts[parts.length - 1], {{ create: true }});
-  return await fileHandle.createWritable();
+  return await curDir.getFileHandle(parts[parts.length - 1], {{ create: true }});
 }}
 
-async function startParallelFolderDownload(manifestUrl, folderName) {{
+async function startParallelFolderDownload(manifestUrl, folderName, forceBrowserDownloads = false) {{
   if (activeTransferAbort) {{
     showToast('Transfer already in progress');
     return;
@@ -1309,7 +1396,7 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
 
   // Prefer File System Access API (showDirectoryPicker) to write nested files straight to disk uncompressed
   let rootDirHandle = null;
-  if (typeof window.showDirectoryPicker === 'function') {{
+  if (!forceBrowserDownloads && typeof window.showDirectoryPicker === 'function') {{
     try {{
       const picked = await window.showDirectoryPicker({{ mode: 'readwrite' }});
       rootDirHandle = await picked.getDirectoryHandle(manifest.root || folderName || 'fastshare', {{ create: true }});
@@ -1333,15 +1420,20 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
   const totalBytes = manifest.total_bytes || files.reduce((acc, f) => acc + (f.size || 0), 0);
   hudBar.style.width = '0%';
   hud.classList.add('active');
+  if (!rootDirHandle) {{
+    showToast('Large files will stream through the browser download manager; allow multiple downloads if prompted');
+  }}
 
   const origins = await resolveShardedOrigins(files[0].url);
-  const numWorkers = origins.length > 1 ? 16 : 6;
+  const preferredWorkers = origins.length > 1 ? 16 : 6;
+  const numWorkers = Math.max(1, Math.min(preferredWorkers, manifest.max_concurrent || preferredWorkers));
   hudMode.textContent = rootDirHandle
     ? `${{numWorkers}}x Folder Sync -> Disk`
-    : `${{numWorkers}}x Parallel Folder`;
+    : `${{numWorkers}}x Parallel + Browser Disk`;
 
   let totalBytesReceived = 0;
   let completedFiles = 0;
+  let browserManagedFiles = 0;
   const startTime = performance.now();
   let lastTickTime = startTime;
   let lastTickBytes = 0;
@@ -1354,7 +1446,7 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
       const bps = db / dt;
       lastTickTime = now;
       lastTickBytes = totalBytesReceived;
-      hudSpeed.textContent = formatSpeedJs(bps);
+      hudSpeed.textContent = browserManagedFiles > 0 ? 'Browser managed' : formatSpeedJs(bps);
     }}
     const pct = totalBytes > 0 ? Math.min(100, (totalBytesReceived / totalBytes) * 100) : ((completedFiles / files.length) * 100);
     hudBar.style.width = pct.toFixed(1) + '%';
@@ -1366,13 +1458,24 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
     const fileName = fileObj.path.split('/').pop() || 'download.bin';
     hudTitle.textContent = `[${{completedFiles + 1}}/${{files.length}}] ${{fileObj.path}}`;
 
+    let fileHandle = null;
     let writable = null;
     if (rootDirHandle) {{
-      writable = await createNestedFileWritable(rootDirHandle, fileObj.path);
+      fileHandle = await getNestedFileHandle(rootDirHandle, fileObj.path);
+    }}
+
+    if (!rootDirHandle && fileSize > 256 * 1048576) {{
+      queueBrowserDownload(fileObj.url, fileObj.path);
+      browserManagedFiles++;
+      completedFiles++;
+      totalBytesReceived += fileSize;
+      await new Promise(r => setTimeout(r, 350));
+      return;
     }}
 
     if (fileSize === 0) {{
-      if (writable) {{
+      if (fileHandle) {{
+        writable = await fileHandle.createWritable();
         await writable.close();
       }} else {{
         const blob = new Blob([], {{ type: 'application/octet-stream' }});
@@ -1391,9 +1494,23 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
 
     const chunkSize = fileSize >= 64 * 1048576 ? 8 * 1048576 : 2 * 1048576;
     const numChunks = Math.ceil(fileSize / chunkSize);
+    const resumeKey = resumeStorageKey('folder', fileObj.url);
+    let resumeBytes = 0;
+    if (fileHandle) {{
+      const existing = await fileHandle.getFile();
+      let saved = null;
+      try {{ saved = JSON.parse(localStorage.getItem(resumeKey) || 'null'); }} catch (_) {{}}
+      if (saved && saved.etag === (fileObj.etag || '') && saved.totalSize === fileSize) {{
+        resumeBytes = Math.min(fileSize, Math.floor(existing.size / chunkSize) * chunkSize);
+      }}
+      writable = await fileHandle.createWritable({{ keepExistingData: true }});
+      await writable.truncate(resumeBytes);
+      await writable.seek(resumeBytes);
+      totalBytesReceived += resumeBytes;
+    }}
     const completedChunks = new Array(numChunks);
-    let nextChunkToAssign = 0;
-    let nextChunkToWrite = 0;
+    let nextChunkToAssign = Math.floor(resumeBytes / chunkSize);
+    let nextChunkToWrite = nextChunkToAssign;
     let isWriting = false;
 
     async function flushQueue() {{
@@ -1405,6 +1522,17 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
           completedChunks[nextChunkToWrite] = null;
           await writable.write(data);
           nextChunkToWrite++;
+          if (fileHandle && nextChunkToWrite < numChunks && nextChunkToWrite % 16 === 0) {{
+            await writable.close();
+            try {{
+              localStorage.setItem(resumeKey, JSON.stringify({{
+                etag: fileObj.etag || '',
+                totalSize: fileSize
+              }}));
+            }} catch (_) {{}}
+            writable = await fileHandle.createWritable({{ keepExistingData: true }});
+            await writable.seek(nextChunkToWrite * chunkSize);
+          }}
         }}
       }} finally {{
         isWriting = false;
@@ -1427,27 +1555,15 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
 
         if (cell) cell.classList.add('busy');
         try {{
-          const resp = await fetch(origin + fileObj.url, {{
-            method: 'GET',
-            mode: 'cors',
-            headers: {{ 'Range': `bytes=${{startByte}}-${{endByte}}` }},
-            signal: abortCtrl.signal
-          }});
-          if (!resp.ok && resp.status !== 206) {{
-            throw new Error(`HTTP ${{resp.status}} on ${{fileObj.path}}`);
-          }}
-          const reader = resp.body.getReader();
-          const expectedLen = endByte - startByte + 1;
-          const chunkBuf = new Uint8Array(expectedLen);
-          let offset = 0;
-          while (true) {{
-            const {{ done, value }} = await reader.read();
-            if (done) break;
-            chunkBuf.set(value, offset);
-            offset += value.byteLength;
-            totalBytesReceived += value.byteLength;
-          }}
-          completedChunks[chunkIdx] = offset === expectedLen ? chunkBuf : chunkBuf.subarray(0, offset);
+          const chunkBuf = await fetchValidatedRange(
+            origin + fileObj.url,
+            startByte,
+            endByte,
+            abortCtrl.signal,
+            fileObj.etag || ''
+          );
+          totalBytesReceived += chunkBuf.byteLength;
+          completedChunks[chunkIdx] = chunkBuf;
           if (writable) await flushQueue();
         }} finally {{
           if (cell) cell.classList.remove('busy');
@@ -1465,6 +1581,13 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
       if (writable) {{
         await flushQueue();
         await writable.close();
+        try {{
+          localStorage.setItem(resumeKey, JSON.stringify({{
+            etag: fileObj.etag || '',
+            totalSize: fileSize,
+            complete: true
+          }}));
+        }} catch (_) {{}}
       }} else {{
         const blob = new Blob(completedChunks, {{ type: 'application/octet-stream' }});
         const blobUrl = URL.createObjectURL(blob);
@@ -1516,7 +1639,11 @@ async function startParallelFolderDownload(manifestUrl, folderName) {{
     if (!abortCtrl.signal.aborted) {{
       const elapsedSec = Math.max(0.01, (performance.now() - startTime) / 1000);
       const avgBps = totalBytesReceived / elapsedSec;
-      showToast(`Downloaded ${{completedFiles}} files in ${{elapsedSec.toFixed(1)}}s (${{formatSpeedJs(avgBps)}})`);
+      if (browserManagedFiles > 0) {{
+        showToast(`Started ${{browserManagedFiles}} large browser download(s); ${{completedFiles}}/${{files.length}} files handled`);
+      }} else {{
+        showToast(`Downloaded ${{completedFiles}} files in ${{elapsedSec.toFixed(1)}}s (${{formatSpeedJs(avgBps)}})`);
+      }}
     }}
   }} catch (err) {{
     if (!abortCtrl.signal.aborted) {{
@@ -1604,6 +1731,7 @@ if (ttlEl) {{
         telemetry_html = telemetry_html,
         rows_html = rows_html,
         batch_json = batch_json,
+        max_concurrent = ctx.max_concurrent,
     )
 }
 

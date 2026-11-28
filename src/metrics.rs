@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct TransferSnapshot {
@@ -57,6 +58,7 @@ pub struct Metrics {
     pub net_info: RwLock<NetworkInfo>,
     pub last_tick: RwLock<Instant>,
     pub security: Arc<SecurityManager>,
+    pub transfer_slots: Arc<Semaphore>,
 }
 
 impl Metrics {
@@ -80,6 +82,7 @@ impl Metrics {
         for _ in 0..120 {
             history.push_back(0);
         }
+        let max_concurrent = sec_cfg.max_concurrent.max(1);
         Arc::new(Self {
             next_id: AtomicU64::new(1),
             total_bytes_sent: AtomicU64::new(0),
@@ -92,6 +95,7 @@ impl Metrics {
             net_info: RwLock::new(net_info),
             last_tick: RwLock::new(Instant::now()),
             security: Arc::new(SecurityManager::new(sec_cfg)),
+            transfer_slots: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
 
@@ -240,12 +244,49 @@ pub struct TransferGuard {
 
 impl TransferGuard {
     #[inline]
-    pub fn record_bytes(&self, n: usize) {
+    pub fn record_bytes(&self, n: usize) -> usize {
         let n64 = n as u64;
-        self.transfer.bytes_sent.fetch_add(n64, Ordering::Relaxed);
-        self.metrics
-            .total_bytes_sent
-            .fetch_add(n64, Ordering::Relaxed);
+        let allowed = match self.metrics.security.max_bytes {
+            None => {
+                self.metrics
+                    .total_bytes_sent
+                    .fetch_add(n64, Ordering::Relaxed);
+                n64
+            }
+            Some(limit) => loop {
+                let current = self.metrics.total_bytes_sent.load(Ordering::SeqCst);
+                let remaining = limit.saturating_sub(current);
+                let allowed = n64.min(remaining);
+                if allowed == 0 {
+                    self.metrics
+                        .security
+                        .disable_link("Maximum data transfer quota reached");
+                    break 0;
+                }
+                if self
+                    .metrics
+                    .total_bytes_sent
+                    .compare_exchange(
+                        current,
+                        current + allowed,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    if allowed < n64 || current + allowed >= limit {
+                        self.metrics
+                            .security
+                            .disable_link("Maximum data transfer quota reached");
+                    }
+                    break allowed;
+                }
+            },
+        };
+        self.transfer
+            .bytes_sent
+            .fetch_add(allowed, Ordering::Relaxed);
+        allowed as usize
     }
 }
 

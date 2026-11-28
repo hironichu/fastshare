@@ -16,6 +16,7 @@ use axum::Router;
 use bytes::Bytes;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
@@ -47,6 +49,34 @@ pub struct ManifestFile {
     pub path: String,
     pub url: String,
     pub size: u64,
+    pub modified: u64,
+    pub etag: String,
+}
+
+struct CollectedFile {
+    path: PathBuf,
+    relative_path: String,
+    size: u64,
+    modified: u64,
+}
+
+struct FileServeRequest<'a> {
+    client_addr: Option<SocketAddr>,
+    method: Method,
+    headers: &'a HeaderMap,
+    file_path: &'a Path,
+    clean_rel: &'a str,
+    file_size: u64,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+enum DownloadGate {
+    Acquired(OwnedSemaphorePermit),
+    Rejected(Response),
+}
+
+fn file_etag(size: u64, modified: u64) -> String {
+    format!("\"{:x}-{:x}\"", size, modified)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -54,6 +84,8 @@ pub struct FolderManifest {
     pub root: String,
     pub total_files: usize,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
     pub files: Vec<ManifestFile>,
 }
 
@@ -132,7 +164,9 @@ async fn security_headers_and_ip_guard(
             .read()
             .ok()
             .and_then(|r| r.clone())
-            .unwrap_or_else(|| "This share link has expired or reached its configured quota.".to_string());
+            .unwrap_or_else(|| {
+                "This share link has expired or reached its configured quota.".to_string()
+            });
         return attach_security_headers(
             (
                 StatusCode::GONE,
@@ -167,11 +201,13 @@ fn attach_security_headers(mut resp: Response) -> Response {
     );
     h.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Range, Authorization, Content-Type"),
+        HeaderValue::from_static("Range, If-Range, Authorization, Content-Type"),
     );
     h.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("Content-Length, Content-Range, Accept-Ranges"),
+        HeaderValue::from_static(
+            "Content-Length, Content-Range, Accept-Ranges, ETag, X-FastShare-Max-Concurrent",
+        ),
     );
     h.insert(
         "Cross-Origin-Resource-Policy",
@@ -245,9 +281,10 @@ async fn handle_login(
 
     if state.metrics.security.verify_password(&form.password) {
         state.metrics.security.clear_auth_failures(addr.ip());
-        state
-            .metrics
-            .log(format!("Auth  [{}] unlocked password-protected share", addr.ip()));
+        state.metrics.log(format!(
+            "Auth  [{}] unlocked password-protected share",
+            addr.ip()
+        ));
         let ticket = state.metrics.security.create_client_ticket(addr.ip());
         let cookie = format!(
             "fastshare_session={}; HttpOnly; SameSite=Strict; Path=/{}",
@@ -261,11 +298,7 @@ async fn handle_login(
         resp
     } else {
         record_invalid_attempt(&state, addr.ip(), "wrong password");
-        let rem_ttl = state
-            .metrics
-            .security
-            .remaining_ttl()
-            .map(|d| d.as_secs());
+        let rem_ttl = state.metrics.security.remaining_ttl().map(|d| d.as_secs());
         let html = render_login_page(
             &state.token,
             &safe_redirect,
@@ -321,7 +354,10 @@ fn is_request_authenticated(
         for part in cookie_hdr.split(';') {
             if let Some((k, v)) = part.trim().split_once('=') {
                 if k.trim() == "fastshare_session"
-                    && state.metrics.security.verify_client_ticket(client_ip, v.trim())
+                    && state
+                        .metrics
+                        .security
+                        .verify_client_ticket(client_ip, v.trim())
                 {
                     return true;
                 }
@@ -334,7 +370,10 @@ fn is_request_authenticated(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
-        if let Some(b64) = auth_hdr.strip_prefix("Basic ").or_else(|| auth_hdr.strip_prefix("basic ")) {
+        if let Some(b64) = auth_hdr
+            .strip_prefix("Basic ")
+            .or_else(|| auth_hdr.strip_prefix("basic "))
+        {
             if let Some(decoded_bytes) = base64_decode(b64) {
                 if let Ok(decoded_str) = std::str::from_utf8(&decoded_bytes) {
                     let pw = match decoded_str.split_once(':') {
@@ -365,11 +404,7 @@ async fn handle_root(
         return not_found_token_response();
     }
     if !is_request_authenticated(&state, addr.ip(), &headers, &query) {
-        let rem_ttl = state
-            .metrics
-            .security
-            .remaining_ttl()
-            .map(|d| d.as_secs());
+        let rem_ttl = state.metrics.security.remaining_ttl().map(|d| d.as_secs());
         let html = render_login_page(&state.token, &format!("/{}/", state.token), None, rem_ttl);
         return (StatusCode::UNAUTHORIZED, Html(html)).into_response();
     }
@@ -389,11 +424,7 @@ async fn handle_path(
         return not_found_token_response();
     }
     if !is_request_authenticated(&state, addr.ip(), &headers, &query) {
-        let rem_ttl = state
-            .metrics
-            .security
-            .remaining_ttl()
-            .map(|d| d.as_secs());
+        let rem_ttl = state.metrics.security.remaining_ttl().map(|d| d.as_secs());
         let html = render_login_page(
             &state.token,
             &format!("/{}/{}", state.token, rel_path),
@@ -500,15 +531,19 @@ async fn serve_entry(
             .await;
         }
         if let Some(archive_fmt) = query.archive.as_deref() {
-            if let Err(resp) = check_download_gates(state, client_addr, &format!("archive:{}", clean_rel)) {
-                return resp;
-            }
+            let permit =
+                match check_download_gates(state, client_addr, &format!("archive:{}", clean_rel)) {
+                    DownloadGate::Acquired(permit) => permit,
+                    DownloadGate::Rejected(resp) => return resp,
+                };
             match archive_fmt {
                 "zip" => {
-                    return stream_folder_zip(state, client_addr, &target_path, &clean_rel).await
+                    return stream_folder_zip(state, client_addr, &target_path, &clean_rel, permit)
+                        .await
                 }
                 "tar" => {
-                    return stream_folder_tar(state, client_addr, &target_path, &clean_rel).await
+                    return stream_folder_tar(state, client_addr, &target_path, &clean_rel, permit)
+                        .await
                 }
                 _ => {
                     return (StatusCode::BAD_REQUEST, "Unsupported archive format").into_response()
@@ -523,26 +558,33 @@ async fn serve_entry(
                 .body(Body::empty())
                 .unwrap();
         }
-        let mut resp = serve_directory_ui(state, client_addr, headers, &target_path, &clean_rel).await;
+        let mut resp =
+            serve_directory_ui(state, client_addr, headers, &target_path, &clean_rel).await;
         resp.headers_mut()
             .insert("X-FastShare-Type", HeaderValue::from_static("directory"));
         return resp;
     }
 
-    if method != Method::HEAD {
-        if let Err(resp) = check_download_gates(state, client_addr, &clean_rel) {
-            return resp;
+    let permit = if method != Method::HEAD {
+        match check_download_gates(state, client_addr, &clean_rel) {
+            DownloadGate::Acquired(permit) => Some(permit),
+            DownloadGate::Rejected(resp) => return resp,
         }
-    }
+    } else {
+        None
+    };
 
     serve_file_10g(
         state,
-        client_addr,
-        method,
-        headers,
-        &target_path,
-        &clean_rel,
-        metadata.len(),
+        FileServeRequest {
+            client_addr,
+            method,
+            headers,
+            file_path: &target_path,
+            clean_rel: &clean_rel,
+            file_size: metadata.len(),
+            permit,
+        },
     )
     .await
 }
@@ -551,25 +593,31 @@ fn check_download_gates(
     state: &AppState,
     client_addr: Option<SocketAddr>,
     file_key: &str,
-) -> Result<(), Response> {
-    if state.metrics.active_count() >= state.metrics.security.max_concurrent {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Html(render_status_page(
-                "429 Too Many Concurrent Streams",
-                "Maximum simultaneous connections reached.",
-                "HTTP 429",
-            )),
-        )
-            .into_response());
-    }
+) -> DownloadGate {
+    let permit = match state.metrics.transfer_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return DownloadGate::Rejected(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Html(render_status_page(
+                        "429 Too Many Concurrent Streams",
+                        "Maximum simultaneous connections reached.",
+                        "HTTP 429",
+                    )),
+                )
+                    .into_response(),
+            )
+        }
+    };
 
     if let Some(addr) = client_addr {
         let total_sent = state.metrics.total_bytes_sent.load(Ordering::Relaxed);
-        if let Err(reason) = state
-            .metrics
-            .security
-            .try_acquire_download(addr.ip(), file_key, total_sent)
+        if let Err(reason) =
+            state
+                .metrics
+                .security
+                .try_acquire_download(addr.ip(), file_key, total_sent)
         {
             state.metrics.log(format!(
                 "Quota blocked download of '{}' from [{}]: {}",
@@ -577,14 +625,16 @@ fn check_download_gates(
                 addr.ip(),
                 reason
             ));
-            return Err((
-                StatusCode::GONE,
-                Html(render_status_page("410 Quota Reached", &reason, "HTTP 410")),
-            )
-                .into_response());
+            return DownloadGate::Rejected(
+                (
+                    StatusCode::GONE,
+                    Html(render_status_page("410 Quota Reached", &reason, "HTTP 410")),
+                )
+                    .into_response(),
+            );
         }
     }
-    Ok(())
+    DownloadGate::Acquired(permit)
 }
 
 async fn serve_directory_ui(
@@ -597,7 +647,11 @@ async fn serve_directory_ui(
     let mut read_dir = match tokio::fs::read_dir(dir_path).await {
         Ok(rd) => rd,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read directory").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read directory",
+            )
+                .into_response()
         }
     };
 
@@ -617,6 +671,10 @@ async fn serve_directory_ui(
         let modified_ts = mtime_sys
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let version_ts = mtime_sys
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or(0);
         let modified = mtime_sys
             .map(|t| {
@@ -639,6 +697,7 @@ async fn serve_directory_ui(
             size,
             modified,
             modified_ts,
+            version_ts,
         });
     }
 
@@ -673,6 +732,7 @@ async fn serve_directory_ui(
         max_downloads: sec.max_downloads,
         bytes_used: state.metrics.total_bytes_sent.load(Ordering::Relaxed),
         max_bytes: sec.max_bytes,
+        max_concurrent: sec.max_concurrent,
     };
 
     let html = render_directory_page(&ctx, &entries);
@@ -713,17 +773,13 @@ async fn serve_directory_manifest(
     let mut files = Vec::with_capacity(raw_files.len());
     let mut total_bytes = 0u64;
 
-    for (full_path, rel_within_dir) in raw_files {
-        let size = tokio::fs::metadata(&full_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        total_bytes = total_bytes.saturating_add(size);
+    for file in raw_files {
+        total_bytes = total_bytes.saturating_add(file.size);
 
         let full_rel = if clean_rel.is_empty() {
-            rel_within_dir.clone()
+            file.relative_path.clone()
         } else {
-            format!("{}/{}", clean_rel, rel_within_dir)
+            format!("{}/{}", clean_rel, file.relative_path)
         };
         let encoded = format!("/{}/{}", state.token, encode_path_segments(&full_rel));
         let url = match &ticket {
@@ -732,9 +788,11 @@ async fn serve_directory_manifest(
         };
 
         files.push(ManifestFile {
-            path: rel_within_dir,
+            path: file.relative_path,
             url,
-            size,
+            size: file.size,
+            modified: file.modified,
+            etag: file_etag(file.size, file.modified),
         });
     }
 
@@ -760,6 +818,7 @@ async fn serve_directory_manifest(
                 root: root_name,
                 total_files: files.len(),
                 total_bytes,
+                max_concurrent: Some(sec.max_concurrent),
                 files,
             };
             let json = serde_json::to_string(&manifest).unwrap_or_else(|_| "{}".to_string());
@@ -770,20 +829,25 @@ async fn serve_directory_manifest(
                 .body(Body::from(json))
                 .unwrap()
         }
-        _ => (StatusCode::BAD_REQUEST, "Unsupported manifest format (use 1, json, or aria2)").into_response(),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            "Unsupported manifest format (use 1, json, or aria2)",
+        )
+            .into_response(),
     }
 }
 
 /// High-throughput 10GbE file streaming with HTTP/1.1 & HTTP/2 Range support
-async fn serve_file_10g(
-    state: &AppState,
-    client_addr: Option<SocketAddr>,
-    method: Method,
-    headers: &HeaderMap,
-    file_path: &Path,
-    clean_rel: &str,
-    file_size: u64,
-) -> Response {
+async fn serve_file_10g(state: &AppState, request: FileServeRequest<'_>) -> Response {
+    let FileServeRequest {
+        client_addr,
+        method,
+        headers,
+        file_path,
+        clean_rel,
+        file_size,
+        permit,
+    } = request;
     let file_name = file_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -803,6 +867,15 @@ async fn serve_file_10g(
     let mut end_byte: u64 = file_size.saturating_sub(1);
     let mut is_range = false;
 
+    let modified = tokio::fs::metadata(file_path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    let etag = file_etag(file_size, modified);
+
     if let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         if file_size == 0 {
             return (
@@ -812,21 +885,29 @@ async fn serve_file_10g(
             )
                 .into_response();
         }
-        if let Ok(parsed) = http_range_header::parse_range_header(range_val) {
-            if let Ok(ranges) = parsed.validate(file_size) {
-                if let Some(first) = ranges.first() {
-                    start_byte = *first.start();
-                    end_byte = *first.end();
-                    is_range = true;
+        let if_range_matches = headers
+            .get(header::IF_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|value| value == etag)
+            .unwrap_or(true);
+        if if_range_matches {
+            let ranges = match http_range_header::parse_range_header(range_val)
+                .and_then(|parsed| parsed.validate(file_size))
+            {
+                Ok(ranges) if ranges.len() == 1 => ranges,
+                _ => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [(header::CONTENT_RANGE, format!("bytes */{}", file_size))],
+                        Body::empty(),
+                    )
+                        .into_response()
                 }
-            } else {
-                return (
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    [(header::CONTENT_RANGE, format!("bytes */{}", file_size))],
-                    Body::empty(),
-                )
-                    .into_response();
-            }
+            };
+            let first = &ranges[0];
+            start_byte = *first.start();
+            end_byte = *first.end();
+            is_range = true;
         }
     }
 
@@ -847,7 +928,12 @@ async fn serve_file_10g(
         .header(header::CONTENT_TYPE, mime_type.as_ref())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length.to_string())
-        .header(header::CONTENT_DISPOSITION, content_disposition);
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .header(header::ETAG, etag)
+        .header(
+            "X-FastShare-Max-Concurrent",
+            state.metrics.security.max_concurrent.to_string(),
+        );
 
     if is_range {
         resp_builder = resp_builder.header(
@@ -862,13 +948,13 @@ async fn serve_file_10g(
 
     let mut file = match File::open(file_path).await {
         Ok(f) => f,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Unable to open file").into_response(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Unable to open file").into_response()
+        }
     };
 
-    if start_byte > 0 {
-        if file.seek(SeekFrom::Start(start_byte)).await.is_err() {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Unable to seek file").into_response();
-        }
+    if start_byte > 0 && file.seek(SeekFrom::Start(start_byte)).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Unable to seek file").into_response();
     }
 
     let chunk_size = state.chunk_size.max(64 * 1024);
@@ -881,8 +967,8 @@ async fn serve_file_10g(
 
     // Stream file in large chunks (default 2 MiB) for minimal syscall overhead at 10GbE
     let stream = futures::stream::unfold(
-        (file, content_length, guard, chunk_size),
-        |(mut file, mut remaining, guard, chunk_size)| async move {
+        (file, content_length, guard, chunk_size, permit),
+        |(mut file, mut remaining, guard, chunk_size, permit)| async move {
             if remaining == 0 {
                 return None;
             }
@@ -891,15 +977,18 @@ async fn serve_file_10g(
             match file.read(&mut buf).await {
                 Ok(0) => None,
                 Ok(n) => {
-                    buf.truncate(n);
-                    remaining -= n as u64;
-                    guard.record_bytes(n);
+                    let allowed = guard.record_bytes(n);
+                    if allowed == 0 {
+                        return None;
+                    }
+                    buf.truncate(allowed);
+                    remaining -= allowed as u64;
                     Some((
                         Ok::<Bytes, std::io::Error>(Bytes::from(buf)),
-                        (file, remaining, guard, chunk_size),
+                        (file, remaining, guard, chunk_size, permit),
                     ))
                 }
-                Err(e) => Some((Err(e), (file, 0, guard, chunk_size))),
+                Err(e) => Some((Err(e), (file, 0, guard, chunk_size, permit))),
             }
         },
     );
@@ -912,12 +1001,20 @@ async fn collect_files_recursively(
     root_dir: &Path,
     dir_path: &Path,
     allow_hidden: bool,
-) -> Vec<(PathBuf, String)> {
+) -> Vec<CollectedFile> {
     let mut result = Vec::new();
     let mut stack = vec![dir_path.to_path_buf()];
+    let mut visited_dirs = HashSet::new();
 
     while let Some(curr) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&curr).await {
+        let canonical_dir = match tokio::fs::canonicalize(&curr).await {
+            Ok(path) if path.starts_with(root_dir) => path,
+            _ => continue,
+        };
+        if !visited_dirs.insert(canonical_dir.clone()) {
+            continue;
+        }
+        let mut rd = match tokio::fs::read_dir(&canonical_dir).await {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -927,7 +1024,7 @@ async fn collect_files_recursively(
                 continue;
             }
             let path = entry.path();
-            let canon = match std::fs::canonicalize(&path) {
+            let canon = match tokio::fs::canonicalize(&path).await {
                 Ok(c) if c.starts_with(root_dir) => c,
                 _ => continue,
             };
@@ -948,13 +1045,24 @@ async fn collect_files_recursively(
                         .collect::<Vec<_>>()
                         .join("/");
                     if !rel_slash.is_empty() {
-                        result.push((canon, rel_slash));
+                        let modified = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+                            .unwrap_or(0);
+                        result.push(CollectedFile {
+                            path: canon,
+                            relative_path: rel_slash,
+                            size: meta.len(),
+                            modified,
+                        });
                     }
                 }
             }
         }
     }
-    result.sort_by(|a, b| a.1.cmp(&b.1));
+    result.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     result
 }
 
@@ -964,6 +1072,7 @@ async fn stream_folder_zip(
     client_addr: Option<SocketAddr>,
     dir_path: &Path,
     clean_rel: &str,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let archive_name = if clean_rel.is_empty() {
         state
@@ -981,9 +1090,10 @@ async fn stream_folder_zip(
 
     let files = collect_files_recursively(&state.root_dir, dir_path, state.allow_hidden).await;
     let chunk_size = state.chunk_size.max(256 * 1024);
-    let guard = state
-        .metrics
-        .start_transfer(client_addr, format!("{} [ZIP]", archive_name), None, false);
+    let guard =
+        state
+            .metrics
+            .start_transfer(client_addr, format!("{} [ZIP]", archive_name), None, false);
 
     let (duplex_reader, duplex_writer) = tokio::io::duplex(chunk_size * 2);
 
@@ -991,12 +1101,12 @@ async fn stream_folder_zip(
         let mut zip = ZipFileWriter::with_tokio(duplex_writer);
         let mut buf = vec![0u8; chunk_size];
 
-        for (full_path, rel_name) in files {
-            let mut file = match File::open(&full_path).await {
+        for item in files {
+            let mut file = match File::open(&item.path).await {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(_) => return,
             };
-            let builder = ZipEntryBuilder::new(rel_name.into(), Compression::Stored);
+            let builder = ZipEntryBuilder::new(item.relative_path.into(), Compression::Stored);
             let mut entry_writer = match zip.write_entry_stream(builder).await {
                 Ok(w) => w,
                 Err(_) => break,
@@ -1024,15 +1134,19 @@ async fn stream_folder_zip(
 
     let reader_stream = ReaderStream::with_capacity(duplex_reader, chunk_size);
     let metered_stream = futures::stream::unfold(
-        (reader_stream, guard),
-        |(mut rx, guard)| async move {
+        (reader_stream, guard, permit),
+        |(mut rx, guard, permit)| async move {
             use futures::StreamExt;
             match rx.next().await {
                 Some(Ok(bytes)) => {
-                    guard.record_bytes(bytes.len());
-                    Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard)))
+                    let allowed = guard.record_bytes(bytes.len());
+                    if allowed == 0 {
+                        return None;
+                    }
+                    let bytes = bytes.slice(..allowed);
+                    Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, permit)))
                 }
-                Some(Err(e)) => Some((Err(e), (rx, guard))),
+                Some(Err(e)) => Some((Err(e), (rx, guard, permit))),
                 None => None,
             }
         },
@@ -1047,6 +1161,7 @@ async fn stream_folder_zip(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
         .header(header::CONTENT_DISPOSITION, content_disposition)
+        .header("X-FastShare-Archive-Mode", "stored")
         .body(Body::from_stream(metered_stream))
         .unwrap()
 }
@@ -1057,6 +1172,7 @@ async fn stream_folder_tar(
     client_addr: Option<SocketAddr>,
     dir_path: &Path,
     clean_rel: &str,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let archive_name = if clean_rel.is_empty() {
         state
@@ -1074,19 +1190,26 @@ async fn stream_folder_tar(
 
     let files = collect_files_recursively(&state.root_dir, dir_path, state.allow_hidden).await;
     let chunk_size = state.chunk_size.max(256 * 1024);
-    let guard = state
-        .metrics
-        .start_transfer(client_addr, format!("{} [TAR]", archive_name), None, false);
+    let guard =
+        state
+            .metrics
+            .start_transfer(client_addr, format!("{} [TAR]", archive_name), None, false);
 
     let (duplex_reader, duplex_writer) = tokio::io::duplex(chunk_size * 2);
 
     tokio::spawn(async move {
         let mut tar = tokio_tar::Builder::new(duplex_writer);
-        for (full_path, rel_name) in files {
-            if let Ok(mut file) = File::open(&full_path).await {
-                if tar.append_file(&rel_name, &mut file).await.is_err() {
-                    return;
-                }
+        for item in files {
+            let mut file = match File::open(&item.path).await {
+                Ok(file) => file,
+                Err(_) => return,
+            };
+            if tar
+                .append_file(&item.relative_path, &mut file)
+                .await
+                .is_err()
+            {
+                return;
             }
         }
         if let Ok(mut inner) = tar.into_inner().await {
@@ -1096,15 +1219,19 @@ async fn stream_folder_tar(
 
     let reader_stream = ReaderStream::with_capacity(duplex_reader, chunk_size);
     let metered_stream = futures::stream::unfold(
-        (reader_stream, guard),
-        |(mut rx, guard)| async move {
+        (reader_stream, guard, permit),
+        |(mut rx, guard, permit)| async move {
             use futures::StreamExt;
             match rx.next().await {
                 Some(Ok(bytes)) => {
-                    guard.record_bytes(bytes.len());
-                    Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard)))
+                    let allowed = guard.record_bytes(bytes.len());
+                    if allowed == 0 {
+                        return None;
+                    }
+                    let bytes = bytes.slice(..allowed);
+                    Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, permit)))
                 }
-                Some(Err(e)) => Some((Err(e), (rx, guard))),
+                Some(Err(e)) => Some((Err(e), (rx, guard, permit))),
                 None => None,
             }
         },

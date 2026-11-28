@@ -24,7 +24,8 @@
 - **Transfer Quotas & Session TTL**
   - Supports session expiration timers (`--ttl`), logical download limits (`--max-downloads`, deduplicating concurrent `Range` requests per `(client_ip, file)` session), and total byte transfer caps (`--max-gb`).
 - **Client Integration (`aria2c` & Parallel Web Engine)**
-  - Web interface includes a multi-stream `Range` downloader (`Parallel`), one-click `aria2c` integration (dispatching to local `aria2c` JSON-RPC on `:6800`/`:16800`, invoking the `fastshare://` URI handler, and copying the `aria2c` command to the clipboard), and a terminal telemetry interface (`ratatui`).
+  - Web interface includes a resumable, direct-to-disk multi-stream `Range` downloader (`Parallel`), a destination-folder picker through the browser or `fastshare://` client, one-click `aria2c` integration (dispatching to local `aria2c` JSON-RPC on `:6800`/`:16800`, invoking the URI handler, and copying the `aria2c` command to the clipboard), and a terminal telemetry interface (`ratatui`).
+  - The built-in native client checkpoints completed `64 MiB` ranges in `.fastshare.resume` sidecars, validates `ETag`/`Content-Range`, retries failed ranges, and atomically promotes `.fastshare.part` files after completion.
 
 ## Installation
 

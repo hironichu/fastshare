@@ -112,7 +112,6 @@ async fn discover_gateway(local_v4: &Ipv4Addr) -> Result<Gateway<Tokio>, igd_nex
             bind_addr,
             broadcast_address: SocketAddr::V4(SocketAddrV4::new(gw_ip, 1900)),
             timeout: Some(Duration::from_secs(2)),
-            ..Default::default()
         };
         if let Ok(gw) = search_gateway(unicast_opts).await {
             return Ok(gw);
@@ -182,7 +181,12 @@ pub async fn setup_upnp_and_public_ip(
 
                 match map_res {
                     Ok(()) => {
-                        let status = format!("UPnP Active via {} (TCP {} -> {})", gateway.addr.ip(), port, local_sock);
+                        let status = format!(
+                            "UPnP Active via {} (TCP {} -> {})",
+                            gateway.addr.ip(),
+                            port,
+                            local_sock
+                        );
                         metrics.log(format!(
                             "UPnP: Mapped external TCP port {} to {} via gateway {}",
                             port, local_sock, gateway.addr
@@ -242,7 +246,8 @@ async fn fetch_public_ip_http() -> Option<String> {
 
     for (addr, host) in endpoints {
         let connect_fut = TcpStream::connect(addr);
-        if let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_secs(2), connect_fut).await {
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_secs(2), connect_fut).await
+        {
             let req = format!(
                 "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: fastshare/0.1\r\nConnection: close\r\n\r\n",
                 host

@@ -107,6 +107,10 @@ async fn test_token_protection_and_directory_listing() {
     assert!(html.contains("large_sample.bin"));
     assert!(html.contains("subfolder"));
     assert!(html.contains("aria2c"));
+    assert!(html.contains("queueBrowserDownload"));
+    assert!(html.contains("Choose Folder &amp; Download"));
+    assert!(html.contains("handleBrowserFolderBtn"));
+    assert!(!html.contains("Large folders require directory access"));
     assert!(!html.contains(".hidden_secret"));
 }
 
@@ -127,15 +131,133 @@ async fn test_http_range_partial_download() {
         resp.headers().get(header::CONTENT_RANGE).unwrap(),
         "bytes 1000-1999/256000"
     );
-    assert_eq!(
-        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
-        "1000"
-    );
+    assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "1000");
 
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body_bytes.len(), 1000);
     let expected: Vec<u8> = (1000..2000).map(|i| (i % 251) as u8).collect();
     assert_eq!(&body_bytes[..], &expected[..]);
+}
+
+#[tokio::test]
+async fn test_range_validation_and_if_range() {
+    let (_dir, _state, app) = setup_test_app();
+
+    let head = with_connect_info(
+        Request::builder()
+            .method(Method::HEAD)
+            .uri("/secret123token/large_sample.bin")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let head_response = app.clone().oneshot(head).await.unwrap();
+    let etag = head_response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    for invalid_range in ["not-a-range", "bytes=0-9,20-29"] {
+        let request = with_connect_info(
+            Request::builder()
+                .uri("/secret123token/large_sample.bin")
+                .header(header::RANGE, invalid_range)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    let matching = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/large_sample.bin")
+            .header(header::RANGE, "bytes=100-199")
+            .header(header::IF_RANGE, &etag)
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let matching_response = app.clone().oneshot(matching).await.unwrap();
+    assert_eq!(matching_response.status(), StatusCode::PARTIAL_CONTENT);
+
+    let stale = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/large_sample.bin")
+            .header(header::RANGE, "bytes=100-199")
+            .header(header::IF_RANGE, "W/\"stale-version\"")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let stale_response = app.oneshot(stale).await.unwrap();
+    assert_eq!(stale_response.status(), StatusCode::OK);
+    assert_eq!(
+        stale_response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .unwrap(),
+        "256000"
+    );
+}
+
+#[tokio::test]
+async fn test_atomic_concurrency_and_byte_quota() {
+    let (_dir, _state, app) = setup_custom_app(SecurityConfig {
+        password: None,
+        max_downloads: None,
+        max_bytes: None,
+        max_concurrent: 1,
+        ttl: None,
+        max_auth_failures: 5,
+        initial_blacklist: Vec::new(),
+    });
+
+    let first = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/large_sample.bin")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let first_response = app.clone().oneshot(first).await.unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let second = with_ip(
+        Request::builder()
+            .uri("/secret123token/second_file.txt")
+            .body(Body::empty())
+            .unwrap(),
+        "127.0.0.2:54322",
+    );
+    let second_response = app.oneshot(second).await.unwrap();
+    assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(first_response);
+
+    let (_dir, state, quota_app) = setup_custom_app(SecurityConfig {
+        password: None,
+        max_downloads: None,
+        max_bytes: Some(1_000),
+        max_concurrent: 64,
+        ttl: None,
+        max_auth_failures: 5,
+        initial_blacklist: Vec::new(),
+    });
+    let request = with_connect_info(
+        Request::builder()
+            .uri("/secret123token/large_sample.bin")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = quota_app.oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.len(), 1_000);
+    assert_eq!(
+        state
+            .metrics
+            .total_bytes_sent
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1_000
+    );
 }
 
 #[tokio::test]
@@ -187,10 +309,9 @@ async fn test_password_protection_and_session_auth() {
     );
     let resp_unauth = app.clone().oneshot(req_unauth).await.unwrap();
     assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
-    let login_html = String::from_utf8_lossy(
-        &resp_unauth.into_body().collect().await.unwrap().to_bytes(),
-    )
-    .to_string();
+    let login_html =
+        String::from_utf8_lossy(&resp_unauth.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
     assert!(login_html.contains("Authentication Required"));
 
     // 2. Wrong password POST returns 401
@@ -199,7 +320,9 @@ async fn test_password_protection_and_session_auth() {
             .method(Method::POST)
             .uri("/secret123token/__auth")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("password=wrongpass&redirect=%2Fsecret123token%2F"))
+            .body(Body::from(
+                "password=wrongpass&redirect=%2Fsecret123token%2F",
+            ))
             .unwrap(),
     );
     let resp_bad_pw = app.clone().oneshot(req_bad_pw).await.unwrap();
@@ -364,8 +487,14 @@ async fn test_directory_manifest_json_and_aria2() {
     let body = resp_json.into_body().collect().await.unwrap().to_bytes();
     let manifest: fastshare::server::FolderManifest = serde_json::from_slice(&body).unwrap();
     assert_eq!(manifest.total_files, 3); // large_sample.bin, second_file.txt, subfolder/hello.txt (no .hidden_secret)
-    assert!(manifest.files.iter().any(|f| f.path == "subfolder/hello.txt"));
-    assert!(!manifest.files.iter().any(|f| f.path.contains(".hidden_secret")));
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.path == "subfolder/hello.txt"));
+    assert!(!manifest
+        .files
+        .iter()
+        .any(|f| f.path.contains(".hidden_secret")));
 
     // 2. aria2 input file manifest (?manifest=aria2)
     let req_aria2 = with_connect_info(
@@ -377,7 +506,8 @@ async fn test_directory_manifest_json_and_aria2() {
     );
     let resp_aria2 = app.clone().oneshot(req_aria2).await.unwrap();
     assert_eq!(resp_aria2.status(), StatusCode::OK);
-    let text = String::from_utf8_lossy(&resp_aria2.into_body().collect().await.unwrap().to_bytes()).to_string();
+    let text = String::from_utf8_lossy(&resp_aria2.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
     assert!(text.contains("http://127.0.0.1:24567/secret123token/subfolder/hello"));
     assert!(text.contains("  out=subfolder/hello.txt"));
 
@@ -391,7 +521,10 @@ async fn test_directory_manifest_json_and_aria2() {
     );
     let resp_head = app.oneshot(req_head).await.unwrap();
     assert_eq!(resp_head.status(), StatusCode::OK);
-    assert_eq!(resp_head.headers().get("X-FastShare-Type").unwrap(), "directory");
+    assert_eq!(
+        resp_head.headers().get("X-FastShare-Type").unwrap(),
+        "directory"
+    );
 }
 
 #[tokio::test]

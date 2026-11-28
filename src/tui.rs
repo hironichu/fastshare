@@ -84,9 +84,7 @@ async fn tui_loop(
                                 let _ = shutdown_tx.send(true);
                                 break;
                             }
-                            KeyCode::Char('c')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 let _ = shutdown_tx.send(true);
                                 break;
                             }
@@ -263,22 +261,18 @@ fn draw_info_panel(f: &mut ratatui::Frame, area: Rect, metrics: &Arc<Metrics>) {
             Span::raw(" Unban  "),
             Span::styled(
                 "[q]",
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Quit & Close UPnP"),
         ]),
     ];
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " FastShare — HTTP/2 File Server ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " FastShare — HTTP/2 File Server ",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
 
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
@@ -441,10 +435,7 @@ fn draw_logs_panel(
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{}_", input_buf),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{}_", input_buf), Style::default().fg(Color::White)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
